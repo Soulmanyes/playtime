@@ -6,12 +6,16 @@ server over SSH.
   playtime.py sync          push/pull sessions with the server now
   playtime.py stats         print today/week/month/year/all-time totals
   playtime.py summary       rewrite the summary file the Noctalia panel reads
+  playtime.py import        reread Steam's and Prism's own playtime totals
   playtime.py deploy-server copy server.py to the server
 
 Games are found by scanning /proc. Steam games run under Steam's `reaper
 SteamLaunch AppId=N` process, Prism Launcher's Minecraft runs as java with
 org.prismlauncher.EntryPoint, and anything else comes from [[game]] rules in
 the config file.
+
+The all-time totals also include what Steam (localconfig.vdf) and Prism
+(instance.cfg) recorded before tracking started; see the Import section.
 """
 
 import datetime as dt
@@ -20,11 +24,15 @@ import os
 import re
 import signal
 import socket
+import struct
 import sqlite3
 import subprocess
 import sys
 import time
+import threading
 import tomllib
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -45,14 +53,19 @@ DEFAULTS = {
     # menu check).
     "min_session_seconds": 60,
     "ignore_steam_appids": [],
+    # Steam app types whose playtime the all-time import counts ("game",
+    # "application", "tool", "demo", ...). Apps like Wallpaper Engine are
+    # "application" and would otherwise top the list.
+    "import_steam_types": ["game"],
 }
 
-# A poll gap this much longer than poll_seconds means the PC was suspended.
+
 def suspended_total():
     """Seconds this boot has spent suspended: BOOTTIME counts suspend,
     MONOTONIC does not. Unlike a wall-clock gap, a slow sync or an NTP jump
     does not move it."""
     return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
 
 CHECKPOINT_SECONDS = 60
 SUMMARY_SECONDS = 60
@@ -64,6 +77,10 @@ STEAM_ROOTS = [
 ]
 # Steam launches these through reaper too, but they are not games.
 STEAM_TOOL_PREFIXES = ("Proton", "Steam Linux Runtime", "Steamworks Common")
+PRISM_ROOTS = [
+    HOME / ".local/share/PrismLauncher",
+    HOME / ".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher",
+]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -77,6 +94,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_end ON sessions(end);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+-- Totals Steam/Prism recorded themselves. `cutoff` is when that total ends:
+-- tracked sessions only add the part after it.
+CREATE TABLE IF NOT EXISTS imported (
+    key TEXT PRIMARY KEY,
+    game_name TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    seconds INTEGER NOT NULL,
+    cutoff INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS steam_apps (
+    appid INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL
+);
 """
 
 UPSERT = """
@@ -88,6 +119,21 @@ ON CONFLICT(id) DO UPDATE SET
 """
 
 FIELDS = ("id", "game_key", "game_name", "detail", "start", "end", "host")
+
+# Only a newer cutoff replaces the total; names always follow the latest
+# import (a name looked up later replaces the "Steam app N" placeholder).
+UPSERT_IMPORTED = """
+INSERT INTO imported (key, game_name, detail, seconds, cutoff)
+VALUES (:key, :game_name, :detail, :seconds, :cutoff)
+ON CONFLICT(key) DO UPDATE SET
+    game_name = excluded.game_name,
+    detail = excluded.detail,
+    seconds = CASE WHEN excluded.cutoff > imported.cutoff
+                   THEN excluded.seconds ELSE imported.seconds END,
+    cutoff = max(imported.cutoff, excluded.cutoff)
+"""
+
+IMPORTED_FIELDS = ("key", "game_name", "detail", "seconds", "cutoff")
 
 
 def log(msg):
@@ -186,26 +232,34 @@ def read_cmdline(pid):
     return [a.decode(errors="replace") for a in raw.rstrip(b"\0").split(b"\0")]
 
 
+def read_instance_cfg(inst_dir):
+    cfg = {}
+    try:
+        for line in (inst_dir / "instance.cfg").read_text(errors="replace").splitlines():
+            k, sep, v = line.partition("=")
+            if sep:
+                cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
 def prism_instance(pid):
-    """Instance display name from the game's working directory."""
+    """(instance folder, display name) from the game's working directory.
+    The folder is the stable key: Prism renames the display name freely."""
     try:
         cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
     except OSError:
-        return ""
+        return None, ""
     parts = cwd.parts
     if "instances" not in parts:
-        return ""
+        return None, ""
     i = len(parts) - 1 - parts[::-1].index("instances")
     if i + 1 >= len(parts):
-        return ""
-    inst_dir = Path(*parts[: i + 2])
-    try:
-        for line in (inst_dir / "instance.cfg").read_text(errors="replace").splitlines():
-            if line.startswith("name="):
-                return line[5:].strip()
-    except OSError:
-        pass
-    return parts[i + 1]
+        return None, ""
+    folder = parts[i + 1]
+    name = read_instance_cfg(Path(*parts[: i + 2])).get("name") or folder
+    return folder, name
 
 
 def shortcut_name(argv):
@@ -258,7 +312,9 @@ def scan(cfg, steam):
             continue
 
         if "org.prismlauncher.EntryPoint" in argv:
-            found["minecraft"] = ("Minecraft", prism_instance(entry.name))
+            folder, name = prism_instance(entry.name)
+            key = f"prism:{folder}" if folder else "minecraft"
+            found[key] = ("Minecraft", name)
             continue
 
         if rules:
@@ -274,6 +330,272 @@ def scan(cfg, steam):
                         found[f"rule:{r['name']}"] = (r["name"], "")
                         break
     return found
+
+
+# ── Import ───────────────────────────────────────────────────────────────────
+#
+# Steam keeps every game's total playtime for the account in each user's
+# localconfig.vdf (the same numbers SteamDB reads through the Web API), with
+# LastPlayed = when the game last exited. Prism keeps totalTimePlayed per
+# instance. Each import becomes a baseline with a cutoff at the end of the
+# last session it includes; all-time adds only tracked time after the cutoff,
+# so nothing is counted twice however often the import runs.
+
+VDF_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])')
+
+
+def parse_vdf(text):
+    """Text KeyValues (localconfig.vdf, libraryfolders.vdf) to nested dicts."""
+    root = {}
+    stack = [root]
+    key = None
+    for m in VDF_TOKEN.finditer(text):
+        s, brace = m.group(1), m.group(2)
+        if brace == "{":
+            child = {}
+            stack[-1][key if key is not None else ""] = child
+            stack.append(child)
+            key = None
+        elif brace == "}":
+            if len(stack) > 1:
+                stack.pop()
+            key = None
+        elif key is None:
+            key = s
+        else:
+            stack[-1][key] = s.replace('\\"', '"').replace("\\\\", "\\")
+            key = None
+    return root
+
+
+def vdf_get(d, *path):
+    """Case-insensitive walk; Steam is not consistent about key case."""
+    for p in path:
+        if not isinstance(d, dict):
+            return None
+        lower = p.lower()
+        d = next((v for k, v in d.items() if k.lower() == lower), None)
+    return d
+
+
+def read_appinfo(path, wanted):
+    """Name and type of the wanted appids from Steam's binary appinfo.vdf
+    cache (formats 28 and 29). Unknown formats return nothing."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    magic, = struct.unpack_from("<I", data, 0)
+    if magic == 0x07564429:
+        table_at, = struct.unpack_from("<Q", data, 8)
+        count, = struct.unpack_from("<I", data, table_at)
+        strings = data[table_at + 4:].split(b"\0", count)[:count]
+        pos = 16
+    elif magic == 0x07564428:
+        strings = None
+        pos = 8
+    else:
+        return {}
+
+    def cstring(at):
+        end = data.index(b"\0", at)
+        return data[at:end].decode(errors="replace"), end + 1
+
+    def read_kv(at):
+        out = {}
+        while True:
+            kind = data[at]
+            at += 1
+            if kind in (0x08, 0x0B):
+                return out, at
+            if strings is not None:
+                idx, = struct.unpack_from("<I", data, at)
+                key = strings[idx].decode(errors="replace")
+                at += 4
+            else:
+                key, at = cstring(at)
+            if kind == 0x00:
+                out[key], at = read_kv(at)
+            elif kind == 0x01:
+                out[key], at = cstring(at)
+            elif kind in (0x02, 0x04, 0x06):
+                out[key], = struct.unpack_from("<i", data, at)
+                at += 4
+            elif kind == 0x03:
+                out[key], = struct.unpack_from("<f", data, at)
+                at += 4
+            elif kind == 0x07:
+                out[key], = struct.unpack_from("<Q", data, at)
+                at += 8
+            elif kind == 0x0A:
+                out[key], = struct.unpack_from("<q", data, at)
+                at += 8
+            else:
+                raise ValueError(f"appinfo: unknown value type {kind}")
+
+    found = {}
+    while pos + 8 <= len(data):
+        appid, size = struct.unpack_from("<II", data, pos)
+        if appid == 0:
+            break
+        start = pos + 8
+        pos = start + size
+        if appid not in wanted:
+            continue
+        # info state, last updated, PICS token, SHA-1, change number, binary SHA-1
+        try:
+            kv, _ = read_kv(start + 4 + 4 + 8 + 20 + 4 + 20)
+        except (ValueError, IndexError, struct.error):
+            continue
+        common = vdf_get(kv, "appinfo", "common") or vdf_get(kv, "common") or {}
+        name = common.get("name")
+        if name:
+            found[appid] = (name, str(common.get("type", "")).lower())
+    return found
+
+
+def steam_roots():
+    seen, out = set(), []
+    for root in STEAM_ROOTS:
+        try:
+            key = root.resolve()
+        except OSError:
+            continue
+        if root.exists() and key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+
+def steam_playtimes():
+    """{appid: (seconds, last_played)} over every Steam user on this PC."""
+    totals = {}
+    for root in steam_roots():
+        for cfg in (root / "userdata").glob("*/config/localconfig.vdf"):
+            if cfg.parts[-3] == "0":
+                continue
+            try:
+                apps = vdf_get(parse_vdf(cfg.read_text(errors="replace")),
+                               "UserLocalConfigStore", "Software", "Valve", "Steam", "apps")
+            except OSError:
+                continue
+            for appid, info in (apps or {}).items():
+                if not appid.isdigit() or not isinstance(info, dict):
+                    continue
+                appid = int(appid)
+                # Non-Steam shortcuts use ids with the top bit set.
+                if appid >= 2 ** 31:
+                    continue
+                try:
+                    minutes = int(vdf_get(info, "Playtime") or 0)
+                    last = int(vdf_get(info, "LastPlayed") or 0)
+                except ValueError:
+                    continue
+                if minutes > 0 and minutes * 60 > totals.get(appid, (0, 0))[0]:
+                    totals[appid] = (minutes * 60, last)
+    return totals
+
+
+def steam_app_info(db, steam, appids):
+    """{appid: (name, type)}: names from installed manifests win (they match
+    the tracker's names), the rest come from appinfo.vdf, cached in the DB.
+    Apps in neither are left for fetch_store_names."""
+    known = {r["appid"]: (r["name"], r["type"])
+             for r in db.execute("SELECT appid, name, type FROM steam_apps")}
+    missing = {a for a in appids if a not in known}
+    if missing:
+        for root in steam_roots():
+            for appid, info in read_appinfo(root / "appcache" / "appinfo.vdf", missing).items():
+                known[appid] = info
+                db.execute("INSERT OR REPLACE INTO steam_apps (appid, name, type) VALUES (?, ?, ?)",
+                           (appid, info[0], info[1]))
+        db.commit()
+    out = {}
+    for appid in appids:
+        name, kind = known.get(appid, (None, ""))
+        out[appid] = (steam.get(appid) or name or f"Steam app {appid}", kind)
+    return out
+
+
+def missing_app_names(db, appids):
+    have = {r[0] for r in db.execute("SELECT appid FROM steam_apps")}
+    return [a for a in appids if a not in have]
+
+
+def fetch_store_names(appids, stopping=lambda: False):
+    """Look up names the local caches lack in the public Steam store API (no
+    key; it allows about 200 requests per 5 minutes, so this goes slowly).
+    Runs in its own thread with its own DB connection. A failed lookup is
+    stored with an empty name so it is not retried every start."""
+    db = open_db()
+    for appid in appids:
+        if stopping():
+            break
+        url = f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
+        req = urllib.request.Request(url, headers={"User-Agent": "playtime"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                entry = json.load(r).get(str(appid)) or {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(120)
+            continue
+        except (OSError, ValueError):
+            time.sleep(30)  # offline: try the rest later, slower
+            continue
+        data = entry.get("data") or {} if entry.get("success") else {}
+        db.execute("INSERT OR REPLACE INTO steam_apps (appid, name, type) VALUES (?, ?, ?)",
+                   (appid, data.get("name", ""), str(data.get("type", "")).lower()))
+        db.commit()
+        time.sleep(1.6)
+    db.close()
+
+
+def prism_playtimes():
+    """{folder: (display name, seconds, cutoff)} for each Prism instance."""
+    out = {}
+    for root in PRISM_ROOTS:
+        for cfg_path in (root / "instances").glob("*/instance.cfg"):
+            cfg = read_instance_cfg(cfg_path.parent)
+            try:
+                total = int(cfg.get("totalTimePlayed") or 0)
+                launched = int(cfg.get("lastLaunchTime") or 0) // 1000
+                last = int(cfg.get("lastTimePlayed") or 0)
+            except ValueError:
+                continue
+            if total > 0:
+                folder = cfg_path.parent.name
+                # lastTimePlayed is the length of the last session.
+                out[folder] = (cfg.get("name") or folder, total, launched + last)
+    return out
+
+
+def import_totals(db, cfg, steam, running=()):
+    """Refresh the baselines. Games running now are skipped: their files may
+    be mid-update, and the next import after they exit picks them up."""
+    rows = []
+    ignore = {int(a) for a in cfg["ignore_steam_appids"]}
+    types = {t.lower() for t in cfg["import_steam_types"]}
+    playtimes = steam_playtimes()
+    infos = steam_app_info(db, steam, [a for a in playtimes if a not in ignore])
+    for appid, (name, kind) in infos.items():
+        key = f"steam:{appid}"
+        # An unknown type (not looked up yet, or the lookup failed) is
+        # imported; summarize() drops it again once the type is known.
+        if key in running or (kind and kind not in types) or name.startswith(STEAM_TOOL_PREFIXES):
+            continue
+        seconds, last = playtimes[appid]
+        rows.append({"key": key, "game_name": name, "detail": "",
+                     "seconds": seconds, "cutoff": last})
+    for folder, (name, seconds, cutoff) in prism_playtimes().items():
+        key = f"prism:{folder}"
+        if key in running:
+            continue
+        rows.append({"key": key, "game_name": "Minecraft", "detail": name,
+                     "seconds": seconds, "cutoff": cutoff})
+    db.executemany(UPSERT_IMPORTED, rows)
+    db.commit()
+    return len(rows)
 
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
@@ -298,10 +620,11 @@ def sync(db, cfg):
     """Send every local session, upsert what comes back. Returns an error
     string, or None on success."""
     rows = [dict(r) for r in db.execute(f"SELECT {', '.join(FIELDS)} FROM sessions")]
+    imported = [dict(r) for r in db.execute(f"SELECT {', '.join(IMPORTED_FIELDS)} FROM imported")]
     remote = cfg["remote_dir"].rstrip("/")
     cmd = ssh_base(cfg) + [f"python3 {remote}/server.py {remote}/playtime.db"]
     try:
-        proc = subprocess.run(cmd, input=json.dumps({"sessions": rows}),
+        proc = subprocess.run(cmd, input=json.dumps({"sessions": rows, "imported": imported}),
                               capture_output=True, text=True, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as e:
         err = f"sync failed: {e}"
@@ -311,11 +634,15 @@ def sync(db, cfg):
             err = f"sync failed: {lines[-1] if lines else f'exit {proc.returncode}'}"
         else:
             try:
-                back = json.loads(proc.stdout)["sessions"]
+                reply = json.loads(proc.stdout)
+                back = reply["sessions"]
+                back_imported = reply.get("imported", [])
             except (ValueError, KeyError) as e:
                 err = f"sync failed: bad reply ({e})"
             else:
                 db.executemany(UPSERT, [{k: r[k] for k in FIELDS} for r in back])
+                db.executemany(UPSERT_IMPORTED,
+                               [{k: r[k] for k in IMPORTED_FIELDS} for r in back_imported])
                 db.commit()
                 set_meta(db, "sync_ok", str(int(time.time())))
                 set_meta(db, "sync_error", "")
@@ -372,57 +699,97 @@ def period_edges(now, first_start):
     return out
 
 
-def summarize(db, live=()):
+def group_key(game_key):
+    """Steam games group by AppId (names can differ between the manifest and
+    the store); every Prism instance groups under Minecraft."""
+    return "minecraft" if game_key.startswith(("prism:", "minecraft")) else game_key
+
+
+def imported_rows(db, import_types):
+    """Baselines, minus Steam apps whose type the config does not count. The
+    filter runs here, not at import, so the server's copy can stay complete."""
+    types = {t.lower() for t in import_types}
+    kinds = {f"steam:{r[0]}": r[1] for r in db.execute("SELECT appid, type FROM steam_apps")}
+    return [dict(r) for r in db.execute(f"SELECT {', '.join(IMPORTED_FIELDS)} FROM imported")
+            if not (kinds.get(r["key"]) and kinds[r["key"]] not in types)]
+
+
+def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     """Totals per period, per game and per bucket. `live` holds sessions not
-    yet (fully) in the DB as dicts with game_name, detail, start, end."""
+    yet (fully) in the DB as dicts with game_key, game_name, detail, start, end.
+
+    All time also counts the imported Steam/Prism totals: a game's total is
+    its baseline plus tracked time after the baseline's cutoff. The year bars
+    show tracked time only; `before` is the rest of the all-time total."""
     now = dt.datetime.now()
     sessions = {r["id"]: dict(r) for r in db.execute(
-        "SELECT id, game_name, detail, start, end FROM sessions")}
+        "SELECT id, game_key, game_name, detail, start, end FROM sessions")}
     for s in live:
         if s.get("id") in sessions:
             sessions[s["id"]]["end"] = max(sessions[s["id"]]["end"], s["end"])
         else:
             sessions[s.get("id") or uuid.uuid4().hex] = dict(s)
     first = min((s["start"] for s in sessions.values()), default=None)
+    baselines = imported_rows(db, import_types)
+    cutoffs = {b["key"]: b["cutoff"] for b in baselines}
 
     periods = {}
     for pname, (edges, labels) in period_edges(now, first).items():
+        all_time = pname == "all"
         lo, hi = edges[0], edges[-1]
         buckets = [0] * (len(edges) - 1)
         games = {}
+
+        def add(key, name, detail, seconds):
+            g = games.setdefault(group_key(key), {"name": name, "seconds": 0, "details": {}})
+            if not key.startswith(("prism:", "minecraft")):
+                g["name"] = name
+            g["seconds"] += seconds
+            if detail:
+                g["details"][detail] = g["details"].get(detail, 0) + seconds
+
         for s in sessions.values():
             a, b = max(s["start"], lo), min(s["end"], hi)
             if b <= a:
                 continue
-            g = games.setdefault(s["game_name"], {"seconds": 0, "details": {}})
-            g["seconds"] += b - a
-            if s["detail"]:
-                g["details"][s["detail"]] = g["details"].get(s["detail"], 0) + b - a
             for i in range(len(buckets)):
                 x, y = max(a, edges[i]), min(b, edges[i + 1])
                 if y > x:
                     buckets[i] += y - x
+            if all_time:
+                # Time before the cutoff is already in the baseline.
+                a = max(a, cutoffs.get(s["game_key"], 0))
+                if b <= a:
+                    continue
+            add(s["game_key"], s["game_name"], s["detail"], b - a)
+        if all_time:
+            for base in baselines:
+                add(base["key"], base["game_name"], base["detail"], base["seconds"])
+
         game_list = sorted(
-            ({"name": n, "seconds": g["seconds"],
+            ({"name": g["name"], "seconds": g["seconds"],
               "details": sorted(({"name": k, "seconds": v} for k, v in g["details"].items()),
                                 key=lambda d: -d["seconds"])}
-             for n, g in games.items()),
+             for g in games.values()),
             key=lambda g: -g["seconds"])
+        total = sum(g["seconds"] for g in game_list)
         periods[pname] = {
-            "total": sum(g["seconds"] for g in game_list),
+            "total": total,
             "games": game_list,
             "buckets": [{"label": l, "seconds": s} for l, s in zip(labels, buckets)],
         }
+        if all_time:
+            periods[pname]["before"] = max(0, total - sum(buckets))
     return periods
 
 
-def write_summary(db, live_sessions):
+def write_summary(db, live_sessions, cfg):
     now = int(time.time())
     data = {
         "updated": now,
         "live": [{"name": s["game_name"], "detail": s["detail"], "seconds": s["end"] - s["start"]}
                  for s in live_sessions],
-        "periods": summarize(db, live_sessions),
+        "periods": summarize(db, live_sessions, cfg["import_steam_types"]),
         "sync": {
             "ok": int(get_meta(db, "sync_ok") or 0),
             "error": get_meta(db, "sync_error") or "",
@@ -442,12 +809,14 @@ def fmt(seconds):
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def print_stats(db):
+def print_stats(db, cfg, limit=25):
     titles = {"day": "Today", "week": "This week", "month": "This month",
               "year": "This year", "all": "All time"}
-    for pname, p in summarize(db).items():
+    for pname, p in summarize(db, (), cfg["import_steam_types"]).items():
         print(f"{titles[pname]}: {fmt(p['total'])}")
-        for g in p["games"]:
+        if p.get("before"):
+            print(f"  ({fmt(p['before'])} of it from Steam/Prism before tracking)")
+        for g in p["games"][:limit]:
             print(f"  {fmt(g['seconds']):>9}  {g['name']}")
             for d in g["details"]:
                 print(f"  {'':>9}    {fmt(d['seconds'])}  {d['name']}")
@@ -532,6 +901,24 @@ def run():
     next_sync = 0  # sync right away, which also restores history after a reinstall
     log(f"playtime running, db {DB_PATH}, server {cfg['ssh_host']}")
 
+    # Names of played Steam apps that no local cache knows come from the
+    # store, slowly, in the background; the next import picks them up.
+    names_done = threading.Event()
+    try:
+        # Also fills the name cache from appinfo.vdf before the store lookup.
+        import_totals(db, cfg, steam, set(scan(cfg, steam)))
+    except Exception as e:
+        log(f"import failed: {e!r}")
+    missing = missing_app_names(db, list(steam_playtimes()))
+    if missing:
+        log(f"looking up {len(missing)} Steam app names")
+
+        def lookup():
+            fetch_store_names(missing, lambda: stopping)
+            names_done.set()
+
+        threading.Thread(target=lookup, daemon=True).start()
+
     while not stopping:
         now = time.time()
         suspended = suspended_total()
@@ -551,8 +938,17 @@ def run():
             tracker.checkpoint()
             last_checkpoint = now
 
+        if names_done.is_set():
+            names_done.clear()
+            log("Steam app names looked up")
+            next_sync = 0
+
         if now >= next_sync:
             tracker.checkpoint()
+            try:
+                import_totals(db, cfg, steam, set(tracker.active))
+            except Exception as e:  # a half-written Steam file must not stop tracking
+                log(f"import failed: {e!r}")
             err = sync(db, cfg)
             if err:
                 log(err)
@@ -560,7 +956,7 @@ def run():
             last_summary = 0
 
         if now - last_summary >= SUMMARY_SECONDS:
-            write_summary(db, tracker.live())
+            write_summary(db, tracker.live(), cfg)
             last_summary = now
 
         # Sleep in short steps so SIGTERM is handled quickly.
@@ -569,7 +965,7 @@ def run():
             time.sleep(min(1, end - time.time()))
 
     tracker.close_all()
-    write_summary(db, [])
+    write_summary(db, [], cfg)
     err = sync(db, cfg)
     if err:
         log(err)
@@ -581,16 +977,27 @@ def main():
     if cmd == "run":
         run()
     elif cmd == "sync":
-        db = open_db()
-        err = sync(db, load_config())
-        write_summary(db, [])
+        db, cfg = open_db(), load_config()
+        err = sync(db, cfg)
+        write_summary(db, [], cfg)
         if err:
             sys.exit(err)
         print("synced")
     elif cmd == "stats":
-        print_stats(open_db())
+        print_stats(open_db(), load_config())
     elif cmd == "summary":
-        write_summary(open_db(), [])
+        write_summary(open_db(), [], load_config())
+    elif cmd == "import":
+        db, cfg = open_db(), load_config()
+        steam = SteamNames()
+        steam.reload()
+        running = set(scan(cfg, steam))
+        print(f"imported {import_totals(db, cfg, steam, running)} totals"
+              + (f", skipped running: {', '.join(sorted(running))}" if running else ""))
+        missing = missing_app_names(db, list(steam_playtimes()))
+        if missing:
+            print(f"{len(missing)} Steam app names unknown locally; the daemon looks them up")
+        write_summary(db, [], cfg)
     elif cmd == "deploy-server":
         deploy_server(load_config())
     else:

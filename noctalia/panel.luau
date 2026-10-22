@@ -9,6 +9,8 @@ local CHART_HEIGHT = 72
 local CHART_WIDTH = 380
 -- Sparse x labels so 24 hours or 31 days stay readable.
 local LABEL_EVERY = { day = 6, week = 1, month = 5, year = 1, all = 1 }
+-- All time holds every Steam game ever played; a full list is slow to render.
+local MAX_GAMES = 50
 
 local data = nil
 local open = false
@@ -150,11 +152,29 @@ function render()
       ui.label({ text = noctalia.tr("ui.total"), color = "on_surface_variant", flexGrow = 1 }),
       ui.label({ text = shared.duration(total), fontSize = 18, fontWeight = "bold" }),
     }),
-    chart(tab, period.buckets or {}),
   }
+  local tracked = 0
+  for _, b in ipairs(period.buckets or {}) do
+    tracked = tracked + (tonumber(b.seconds) or 0)
+  end
+  -- All time without tracked years yet would be one empty bar.
+  if tab ~= "all" or tracked > 0 then
+    body[#body + 1] = chart(tab, period.buckets or {})
+  end
+  local before = tonumber(period.before) or 0
+  if before > 0 then
+    body[#body + 1] = ui.label({ text = noctalia.tr("ui.before", { time = shared.duration(before) }),
+                                 fontSize = 11, color = "on_surface_variant" })
+  end
 
   local games = {}
-  for _, g in ipairs(period.games or {}) do
+  local list = period.games or {}
+  for i, g in ipairs(list) do
+    if i > MAX_GAMES then
+      games[#games + 1] = ui.label({ text = noctalia.tr("ui.more", { count = #list - MAX_GAMES }),
+                                     fontSize = 11, color = "on_surface_variant" })
+      break
+    end
     games[#games + 1] = gameRow(g, total)
   end
   if #games == 0 then
@@ -163,7 +183,7 @@ function render()
   body[#body + 1] = ui.scroll({ gap = 10, flexGrow = 1 }, games)
   body[#body + 1] = footer()
 
-  panel.render(ui.column({ gap = 12, padding = 16 }, body))
+  panel.render(ui.column({ gap = 12, padding = 16, flexGrow = 1, align = "stretch" }, body))
 end
 
 local function refresh()
@@ -173,7 +193,13 @@ local function refresh()
   end, data)
 end
 
-function onOpen()
+-- `noctalia msg panel-open szblaguen/playtime:panel all` opens on a tab.
+function onOpen(context)
+  for _, name in ipairs(TABS) do
+    if context == name then
+      noctalia.state.set("tab", name)
+    end
+  end
   open = true
   render()
   refresh()
