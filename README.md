@@ -53,8 +53,10 @@ prompt (the daemon uses `BatchMode`), and Python 3.9+ on the server.
 ```sh
 ./install.sh                      # daemon + systemd user service
 ./install.sh ~/path/to/plugins    # also copy the Noctalia plugin into a local plugin source
-playtime deploy-server            # once: copy server.py to the server
 ```
+
+`install.sh` also copies `server.py` to the server, so both sides always
+speak the same sync format.
 
 Edit `~/.config/playtime/config.toml` (from `config.example.toml`) to set the
 SSH host and add rules for non-Steam games.
