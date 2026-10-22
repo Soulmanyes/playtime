@@ -43,16 +43,18 @@ ON CONFLICT(id) DO UPDATE SET
 
 FIELDS = ("id", "game_key", "game_name", "detail", "start", "end", "host")
 
+# Same rule as the client: a total never goes down; `seen:` rows (raw Prism
+# readings) follow the newer cutoff alone.
 UPSERT_IMPORTED = """
 INSERT INTO imported (key, game_name, detail, seconds, cutoff)
 VALUES (:key, :game_name, :detail, :seconds, :cutoff)
 ON CONFLICT(key) DO UPDATE SET
     game_name = excluded.game_name,
     detail = excluded.detail,
-    seconds = CASE WHEN excluded.cutoff > imported.cutoff
-                   THEN excluded.seconds ELSE imported.seconds END,
-    cutoff = max(imported.cutoff, excluded.cutoff)
-"""
+    seconds = CASE WHEN {newer} THEN excluded.seconds ELSE imported.seconds END,
+    cutoff = CASE WHEN {newer} THEN excluded.cutoff ELSE imported.cutoff END
+""".format(newer="excluded.cutoff > imported.cutoff AND (excluded.seconds >= "
+                 "imported.seconds OR imported.key LIKE 'seen:%')")
 
 IMPORTED_FIELDS = ("key", "game_name", "detail", "seconds", "cutoff")
 

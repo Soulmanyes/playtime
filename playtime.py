@@ -74,6 +74,15 @@ def suspended_total():
 
 
 CHECKPOINT_SECONDS = 60
+# Heartbeats come every CHECKPOINT_SECONDS; a gap up to this long still
+# counts as the daemon running.
+UPTIME_GRACE = 2 * CHECKPOINT_SECONDS
+# Prism's total may grow by at most the time between two cutoffs; this much
+# more still counts as the same counter (rounding, clock steps).
+PRISM_SLACK = 120
+# A new instance whose total equals another instance's is a copy made with
+# "Keep play time" (or a moved folder). Shorter totals may match by chance.
+PRISM_COPY_MIN = 60
 SUMMARY_SECONDS = 60
 BACKUP_SECONDS = 24 * 3600
 
@@ -110,6 +119,12 @@ CREATE TABLE IF NOT EXISTS imported (
     seconds INTEGER NOT NULL,
     cutoff INTEGER NOT NULL
 );
+-- When this machine's daemon ran (start, last heartbeat). Prism can only
+-- have counted play the tracker missed while no daemon was running.
+CREATE TABLE IF NOT EXISTS uptime (
+    start INTEGER PRIMARY KEY,
+    end INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS steam_apps (
     appid INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -127,18 +142,25 @@ ON CONFLICT(id) DO UPDATE SET
 
 FIELDS = ("id", "game_key", "game_name", "detail", "start", "end", "host")
 
-# Only a newer cutoff replaces the total; names always follow the latest
-# import (a name looked up later replaces the "Steam app N" placeholder).
+# Only a newer cutoff with at least as many seconds replaces a total, so a
+# baseline never goes down: not through an import, a sync or a restore.
+# `seen:` rows hold Prism's raw readings, which can drop (see import_prism);
+# for them the newer cutoff alone wins. Names always follow the latest import
+# (a name looked up later replaces the "Steam app N" placeholder).
 UPSERT_IMPORTED = """
 INSERT INTO imported (key, game_name, detail, seconds, cutoff)
 VALUES (:key, :game_name, :detail, :seconds, :cutoff)
 ON CONFLICT(key) DO UPDATE SET
     game_name = excluded.game_name,
     detail = excluded.detail,
-    seconds = CASE WHEN excluded.cutoff > imported.cutoff
-                   THEN excluded.seconds ELSE imported.seconds END,
-    cutoff = max(imported.cutoff, excluded.cutoff)
-"""
+    seconds = CASE WHEN {newer} THEN excluded.seconds ELSE imported.seconds END,
+    cutoff = CASE WHEN {newer} THEN excluded.cutoff ELSE imported.cutoff END
+""".format(newer="excluded.cutoff > imported.cutoff AND (excluded.seconds >= "
+                 "imported.seconds OR imported.key LIKE 'seen:%')")
+
+# Raw Prism readings are stored as imported rows under this prefix, so they
+# reach the server and the backups like the baselines do; summaries skip them.
+SEEN = "seen:"
 
 IMPORTED_FIELDS = ("key", "game_name", "detail", "seconds", "cutoff")
 
@@ -559,7 +581,9 @@ def fetch_store_names(appids, stopping=lambda: False):
 
 
 def prism_playtimes():
-    """{folder: (display name, seconds, cutoff)} for each Prism instance."""
+    """{folder: (display name, seconds, cutoff, last session)} for each Prism
+    instance. With both the native and the Flatpak data folder, the newer
+    reading wins."""
     out = {}
     for root in PRISM_ROOTS:
         for cfg_path in (root / "instances").glob("*/instance.cfg"):
@@ -573,8 +597,111 @@ def prism_playtimes():
             if total > 0:
                 folder = cfg_path.parent.name
                 # lastTimePlayed is the length of the last session.
-                out[folder] = (cfg.get("name") or folder, total, launched + last)
+                if folder not in out or launched + last > out[folder][2]:
+                    out[folder] = (cfg.get("name") or folder, total, launched + last, last)
     return out
+
+
+def tracked_seconds(db, key, a, b):
+    """Tracked time of one game inside (a, b]."""
+    return sum(max(0, min(e, b) - max(s, a)) for s, e in db.execute(
+        "SELECT start, end FROM sessions WHERE game_key = ? AND end > ? AND start < ?",
+        (key, a, b)))
+
+
+def downtime(db, a, b):
+    """Seconds of (a, b] when no daemon ran here. Time before the first
+    heartbeat counts as down: nothing is known about it."""
+    covered, pos = 0, a
+    for s, e in db.execute("SELECT start, end FROM uptime WHERE end + ? > ? AND start < ? "
+                           "ORDER BY start", (UPTIME_GRACE, a, b)):
+        s, e = max(s, pos), min(e + UPTIME_GRACE, b)
+        if e > s:
+            covered += e - s
+            pos = e
+    return max(0, b - a - covered)
+
+
+def prism_gain(db, key, base, seen, seconds, cutoff, last, name):
+    """Seconds to add to an instance's baseline for a new reading, or None to
+    leave it alone. Prism's counter only says something new about time after
+    the stored cutoff; tracked time there is known for sure.
+
+    - Same counter, grown by no more than the time that passed: Prism saw
+      `seconds - seen` more; the tracker's figure wins when it saw more.
+    - Anything else is a reset or a swapped instance.cfg (reinstalled OS or
+      modpack, native/Flatpak switch, a restored backup); the old baseline
+      stays and the tracked time is added. A counter holding more than the
+      time since the stored cutoff carries time from before, already
+      counted: of it only the last session (Prism adds exactly that on exit)
+      can be new. Otherwise it started fresh and all of it can be. Either
+      way, only the part the tracker missed while no daemon was running is
+      added, so with the daemon up a reset adds just the tracked time.
+    - An older cutoff (a restored older instance.cfg, not played yet) waits
+      until it is played past the stored one."""
+    if cutoff <= seen["cutoff"]:
+        return None
+    tracked = tracked_seconds(db, key, base["cutoff"], cutoff)
+    grown = seconds - seen["seconds"]
+    if 0 <= grown <= cutoff - seen["cutoff"] + PRISM_SLACK:
+        return max(grown, tracked)
+    if seconds > cutoff - seen["cutoff"] + PRISM_SLACK:
+        start = max(cutoff - last, base["cutoff"])
+        untracked = min(last, cutoff - start) - tracked_seconds(db, key, start, cutoff)
+    else:
+        start = seen["cutoff"]
+        untracked = seconds - tracked
+    gain = tracked + max(0, min(untracked, downtime(db, start, cutoff)))
+    log(f"Prism total of {name} went from {fmt(seen['seconds'])} to {fmt(seconds)}: "
+        f"counted as a reset, adding {fmt(gain)}")
+    return gain
+
+
+def import_prism(db, running=()):
+    """Turn Prism's per-instance totals into baselines that never go down.
+    The raw reading is kept in a `seen:` row next to each baseline, so the
+    next import can tell growth from a reset. Returns the instances read."""
+    readings = prism_playtimes()
+    stored = {r["key"]: dict(r) for r in db.execute(
+        "SELECT key, seconds, cutoff FROM imported WHERE key LIKE 'prism:%' OR key LIKE ?",
+        (SEEN + "prism:%",))}
+    # Totals already accounted for: a new instance that starts from one of
+    # them is a copy.
+    known = {r["seconds"] for k, r in stored.items() if k.startswith(SEEN)}
+    known |= {r[1] for f, r in readings.items() if f"prism:{f}" in stored}
+    rows = []
+    for folder in sorted(readings):
+        name, seconds, cutoff, last = readings[folder]
+        key = f"prism:{folder}"
+        if key in running:
+            continue
+        base = stored.get(key)
+        if base is None:
+            # A copy is often launched right away, so its first reading may
+            # already include one session: Prism adds exactly lastTimePlayed.
+            copied = next((t for t in (seconds, seconds - last)
+                           if t >= PRISM_COPY_MIN and t in known), None)
+            if copied is not None:
+                log(f"Prism instance {name} started from another one's total "
+                    f"({fmt(copied)}): a copy, counting only its own time")
+                baseline = max(seconds - copied, tracked_seconds(db, key, 0, cutoff))
+            else:
+                baseline = seconds
+        else:
+            # Rows from before the seen: rows existed hold the raw reading.
+            gain = prism_gain(db, key, base, stored.get(SEEN + key) or base,
+                              seconds, cutoff, last, name)
+            if gain is None:
+                continue
+            baseline = base["seconds"] + gain
+        known.add(seconds)
+        rows.append({"key": key, "game_name": "Minecraft", "detail": name,
+                     "seconds": baseline, "cutoff": cutoff})
+        rows.append({"key": SEEN + key, "game_name": "", "detail": "",
+                     "seconds": seconds, "cutoff": cutoff})
+    db.executemany(UPSERT_IMPORTED, rows)
+    db.commit()
+    return len(readings)
 
 
 def import_totals(db, cfg, steam, running=()):
@@ -594,15 +721,9 @@ def import_totals(db, cfg, steam, running=()):
         seconds, last = playtimes[appid]
         rows.append({"key": key, "game_name": name, "detail": "",
                      "seconds": seconds, "cutoff": last})
-    for folder, (name, seconds, cutoff) in prism_playtimes().items():
-        key = f"prism:{folder}"
-        if key in running:
-            continue
-        rows.append({"key": key, "game_name": "Minecraft", "detail": name,
-                     "seconds": seconds, "cutoff": cutoff})
     db.executemany(UPSERT_IMPORTED, rows)
     db.commit()
-    return len(rows)
+    return len(rows) + import_prism(db, running)
 
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
@@ -741,10 +862,14 @@ def restore(db, path):
         imported = ([dict(r) for r in src.execute(
             f"SELECT {', '.join(IMPORTED_FIELDS)} FROM imported")]
             if "imported" in tables else [])
+        uptime = (list(src.execute("SELECT start, end FROM uptime"))
+                  if "uptime" in tables else [])
     finally:
         src.close()
     db.executemany(UPSERT, rows)
     db.executemany(UPSERT_IMPORTED, imported)
+    db.executemany("INSERT INTO uptime (start, end) VALUES (?, ?) "
+                   "ON CONFLICT(start) DO UPDATE SET end = max(end, excluded.end)", uptime)
     db.commit()
     return len(rows), len(imported)
 
@@ -801,7 +926,8 @@ def imported_rows(db, import_types):
     types = {t.lower() for t in import_types}
     kinds = {f"steam:{r[0]}": r[1] for r in db.execute("SELECT appid, type FROM steam_apps")}
     return [dict(r) for r in db.execute(f"SELECT {', '.join(IMPORTED_FIELDS)} FROM imported")
-            if not (kinds.get(r["key"]) and kinds[r["key"]] not in types)]
+            if not r["key"].startswith(SEEN)
+            and not (kinds.get(r["key"]) and kinds[r["key"]] not in types)]
 
 
 def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
@@ -1014,6 +1140,15 @@ def run():
     server = server_enabled(cfg)
     keep = cfg["backup_keep"]
     next_backup = 0 if keep > 0 else float("inf")
+    started = int(time.time())
+
+    def heartbeat():
+        db.execute("INSERT INTO uptime (start, end) VALUES (?, ?) "
+                   "ON CONFLICT(start) DO UPDATE SET end = excluded.end",
+                   (started, int(time.time())))
+        db.commit()
+
+    heartbeat()
     log(f"playtime running, db {DB_PATH}, "
         + (f"server {cfg['ssh_host']}" if server else "local only (no ssh_host)"))
 
@@ -1052,6 +1187,7 @@ def run():
 
         if now - last_checkpoint >= CHECKPOINT_SECONDS:
             tracker.checkpoint()
+            heartbeat()
             last_checkpoint = now
 
         if names_done.is_set():
@@ -1092,6 +1228,7 @@ def run():
             time.sleep(min(1, end - time.time()))
 
     tracker.close_all()
+    heartbeat()
     write_summary(db, [], cfg)
     if server:
         err = sync(db, cfg)

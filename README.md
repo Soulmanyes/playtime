@@ -94,47 +94,41 @@ playtime deploy-server  copy server.py to the server
 CachyOS (Hyprland, Noctalia v5), Steam native + Proton, Prism Launcher;
 server on Oracle Linux 9 (Python 3.9, SQLite 3.34).
 
-## Known issues
+## Prism resets and copies
 
-### Prism playtime resets
+Prism keeps each instance's total in `instances/<folder>/instance.cfg`, and
+that counter can reset or be swapped: an OS reinstall without the instances
+folder, a switch between the native package and the Flatpak, a modpack
+reinstalled under the same folder name, or an older backup of the folder put
+back. Prism's copy dialog can also copy an instance **with** its play time.
 
-Prism keeps each instance's total in `instances/<folder>/instance.cfg`
-(`totalTimePlayed`). The import treats a newer cutoff as a newer total, so
-when Prism's own total for an instance goes **down**, the all-time baseline
-goes down with it. Not fixed yet.
+The import handles these so the all-time total never goes down:
 
-When Prism's total can reset:
+- Each instance's last raw reading is kept next to its baseline (a `seen:`
+  row, synced and backed up like the rest). A reading only counts as growth
+  when the counter grew by no more than the time that passed since the last
+  one; then the larger of Prism's growth and the tracked time is added.
+- Anything else counts as a reset. The old baseline stays, the tracked time
+  since is added, and on top of that only what Prism counted while no
+  playtime daemon was running (the daemon records when it runs, in the
+  `uptime` table) and what fits the wall clock. With the daemon running, a
+  reset adds nothing it did not track itself.
+- A reading with an older cutoff than the stored one (an older
+  `instance.cfg` put back) waits until it is played past the stored one.
+- A new instance whose total equals another instance's, or does after its
+  last session is taken off, is a copy: only its own new time counts.
+- With both the native and the Flatpak data folder present, the instance
+  with the newer last session wins.
+- Baselines never go down through an import, a sync or `playtime restore`;
+  the server applies the same rule.
 
-- The OS is reinstalled, or `~/.local/share/PrismLauncher` is deleted,
-  without restoring the instances folder.
-- Switching between the native package and the Flatpak. They use different
-  data folders, so instances added in the new one start at 0.
-- Uninstalling the Flatpak with `--delete-data`. Removing or reinstalling
-  the native package keeps the data.
-- A modpack is deleted and installed again under the **same** folder name.
-- `RecordGameTime` or a per-instance `OverrideGameTime` is changed. Turned
-  off, Prism stops counting; the total does not drop, but it misses time.
-
-What happens then: the next import sees a newer cutoff and replaces the old
-total (for example 761 h of GTNH) with the new small one. Tracked sessions
-between the old and the new cutoff are skipped too, because the code assumes
-the new total already contains them. The server and the local backups do not
-help: sync and `playtime restore` use the same upsert, so the older, bigger
-row loses to the newer one there too.
-
-Cases that are fine:
-
-- A new instance under a **new** folder name (for example a GTNH update
-  installed as a new instance). It gets its own key, and the old row stays.
-- Prism crashing before it saves the total. Prism's total is lower, but the
-  tracked session still counts after the old cutoff.
-
-Double counting: Prism's copy dialog has a **Keep play time** option. A copy
-made with it counts the same hours again under a second key.
-
-Possible fix: when an import has a newer cutoff but fewer seconds than the
-stored row, treat it as a reset. Keep the old baseline, and add the new
-total on top of the tracked time up to the reset.
+What is still guessed: a counter that holds more than the time since the
+last reading carries old time, so only its last session can count as new.
+A smaller counter, read after a time with no daemon running (for example an
+OS reinstall), counts as started fresh: if it was really a small older
+backup, up to its own size is counted twice. The `uptime` history of a machine stays in its local
+database and backups; a fresh install that restores only from the server
+has none, so all time before it counts as downtime.
 
 ## License
 
