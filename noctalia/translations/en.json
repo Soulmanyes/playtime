@@ -1,0 +1,19 @@
+{
+  "ui": {
+    "title": "Playtime",
+    "today": "Today: {time}",
+    "playing": "Playing {game} · {time}",
+    "no-data": "No playtime data yet. Is the playtime service running?",
+    "nothing": "Nothing played in this period.",
+    "tab-day": "Day",
+    "tab-week": "Week",
+    "tab-month": "Month",
+    "tab-year": "Year",
+    "tab-all": "All time",
+    "total": "Total",
+    "synced": "Synced {ago}",
+    "never-synced": "Not synced yet",
+    "sync-error": "Sync error: {error}",
+    "stale": "Data is {ago} old: the daemon may be stopped"
+  }
+}
