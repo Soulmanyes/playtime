@@ -11,6 +11,8 @@
     "tab-year": "Year",
     "tab-all": "All time",
     "total": "Total",
+    "before": "Bars show tracked time; {time} more comes from Steam and Prism totals from before tracking",
+    "more": "+ {count} more games",
     "synced": "Synced {ago}",
     "never-synced": "Not synced yet",
     "sync-error": "Sync error: {error}",

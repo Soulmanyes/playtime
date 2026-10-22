@@ -11,8 +11,12 @@ sync_minutes = 15
 # Shorter sessions are not saved.
 min_session_seconds = 60
 
-# Steam AppIds never to track (tools Steam launches like games, etc.).
+# Steam AppIds never to track or import (tools Steam launches like games, etc.).
 ignore_steam_appids = []
+
+# Steam app types whose earlier playtime counts in all time ("game",
+# "application", "tool", "demo", ...).
+import_steam_types = ["game"]
 
 # Steam games and Prism Launcher Minecraft are found on their own.
 # Other games: one [[game]] block each. `process` matches the executable's
