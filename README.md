@@ -8,20 +8,21 @@ all-time stats per game.
 ## How it works
 
 - **Daemon** (`playtime.py run`, systemd user service) scans `/proc` every
-  10 s. It has no hooks into games and costs well under 0.1% CPU and about
-  15 MB RAM.
+  10 s. It has no hooks into games; one scan takes about 2.5 ms (500
+  processes), and the process uses about 15 MB RAM.
   - **Steam** games (native and Proton) are found through Steam's
     `reaper SteamLaunch AppId=N` process; names come from the local
     `appmanifest_*.acf` files of every Steam library. Proton, Steam Linux
-    Runtime and redistributables are skipped.
+    Runtime and redistributables are skipped. Non-Steam shortcuts are
+    named after their executable (the `.exe` under Proton).
   - **Minecraft** through Prism Launcher is found by the game's java process
     (`org.prismlauncher.EntryPoint`, so the launcher alone does not count);
     the instance name is recorded too.
   - **Other games** come from `[[game]]` rules in the config (executable
     name or command-line regex).
 - Sessions shorter than 60 s are dropped. A running session is saved every
-  minute, so a crash loses at most a minute. A gap between polls (suspend)
-  ends the session at the last time the game was seen.
+  minute, so a crash loses at most a minute. Suspend (detected through
+  `CLOCK_BOOTTIME`) ends the session at the last time the game was seen.
 - **Sync**: `ssh <host> python3 playtime/server.py ...` sends every local
   session and gets every stored one back; both sides upsert by session id,
   so syncing twice never duplicates anything. It runs at start, after each

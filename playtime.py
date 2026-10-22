@@ -48,7 +48,12 @@ DEFAULTS = {
 }
 
 # A poll gap this much longer than poll_seconds means the PC was suspended.
-SUSPEND_GAP_FACTOR = 6
+def suspended_total():
+    """Seconds this boot has spent suspended: BOOTTIME counts suspend,
+    MONOTONIC does not. Unlike a wall-clock gap, a slow sync or an NTP jump
+    does not move it."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
 CHECKPOINT_SECONDS = 60
 SUMMARY_SECONDS = 60
 
@@ -203,6 +208,22 @@ def prism_instance(pid):
     return parts[i + 1]
 
 
+def shortcut_name(argv):
+    """Name for a non-Steam shortcut from the reaper command line: the .exe
+    under Proton, else the first program after `--` that is not Steam's own."""
+    if "--" not in argv:
+        return None
+    args = argv[argv.index("--") + 1:]
+    for a in reversed(args):
+        if a.lower().endswith(".exe"):
+            return os.path.basename(a)[:-4]
+    for a in args:
+        if a.startswith("-") or "/ubuntu12_" in a or "/steamapps/common/" in a:
+            continue
+        return os.path.basename(a) or None
+    return None
+
+
 def scan(cfg, steam):
     """Return {game_key: (game_name, detail)} for every game running now."""
     found = {}
@@ -230,7 +251,7 @@ def scan(cfg, steam):
             name = steam.get(appid)
             if name is None:
                 # Non-Steam shortcuts get a generated AppId with no manifest.
-                name = f"Non-Steam game {appid}"
+                name = shortcut_name(argv) or f"Non-Steam game {appid}"
             if name.startswith(STEAM_TOOL_PREFIXES):
                 continue
             found[f"steam:{appid}"] = (name, "")
@@ -286,7 +307,8 @@ def sync(db, cfg):
         err = f"sync failed: {e}"
     else:
         if proc.returncode != 0:
-            err = f"sync failed: {proc.stderr.strip().splitlines()[-1:] or proc.returncode}"
+            lines = proc.stderr.strip().splitlines()
+            err = f"sync failed: {lines[-1] if lines else f'exit {proc.returncode}'}"
         else:
             try:
                 back = json.loads(proc.stdout)["sessions"]
@@ -505,20 +527,21 @@ def run():
 
     poll = cfg["poll_seconds"]
     sync_every = cfg["sync_minutes"] * 60
-    last_poll = time.time()
+    last_suspended = suspended_total()
     last_checkpoint = last_summary = 0
     next_sync = 0  # sync right away, which also restores history after a reinstall
     log(f"playtime running, db {DB_PATH}, server {cfg['ssh_host']}")
 
     while not stopping:
         now = time.time()
-        if now - last_poll > poll * SUSPEND_GAP_FACTOR:
-            # Suspended (or the clock jumped): nothing was played in the gap.
+        suspended = suspended_total()
+        if suspended - last_suspended > poll:
+            # Nothing was played while suspended: end sessions at last seen.
             if tracker.active:
-                log(f"gap of {int(now - last_poll)}s, closing sessions at last poll")
+                log(f"suspended {int(suspended - last_suspended)}s, closing sessions at last poll")
             if tracker.close_all():
                 next_sync = 0
-        last_poll = now
+        last_suspended = suspended
 
         if tracker.update(scan(cfg, steam), int(now)):
             next_sync = 0
