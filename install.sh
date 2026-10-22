@@ -32,4 +32,7 @@ if [ $# -ge 1 ]; then
     cp -r "$here/noctalia/." "$1/playtime/"
     echo "plugin copied to $1/playtime"
 fi
-echo "installed; run 'playtime deploy-server' once if the server has no server.py yet"
+# The server copy must match the client's sync format, so update it on every
+# install; offline is fine, the next install or `playtime deploy-server` does it.
+"$HOME/.local/bin/playtime" deploy-server || echo "could not reach the server; run 'playtime deploy-server' later"
+echo "installed"
