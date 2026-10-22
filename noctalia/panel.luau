@@ -109,7 +109,15 @@ end
 local function footer()
   local sync = data.sync or {}
   local text, color
-  if sync.error ~= nil and sync.error ~= "" then
+  if sync.enabled == false then
+    local b = tonumber((data.backup or {}).ok) or 0
+    if b > 0 then
+      text = noctalia.tr("ui.local-only-backup", { ago = shared.ago(b) })
+    else
+      text = noctalia.tr("ui.local-only")
+    end
+    color = "on_surface_variant"
+  elseif sync.error ~= nil and sync.error ~= "" then
     text, color = noctalia.tr("ui.sync-error", { error = sync.error }), "error"
   elseif (tonumber(sync.ok) or 0) > 0 then
     text, color = noctalia.tr("ui.synced", { ago = shared.ago(sync.ok) }), "on_surface_variant"

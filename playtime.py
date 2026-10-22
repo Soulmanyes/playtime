@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Playtime tracker: records how long games run and keeps the history on a
-server over SSH.
+"""Playtime tracker: records how long games run in a local SQLite history,
+backs it up daily next to it, and optionally mirrors it to a server over SSH.
 
-  playtime.py run           the daemon (systemd user service)
-  playtime.py sync          push/pull sessions with the server now
-  playtime.py stats         print today/week/month/year/all-time totals
-  playtime.py summary       rewrite the summary file the Noctalia panel reads
-  playtime.py import        reread Steam's and Prism's own playtime totals
-  playtime.py deploy-server copy server.py to the server
+  playtime.py run            the daemon (systemd user service)
+  playtime.py sync           push/pull sessions with the server now
+  playtime.py stats          print today/week/month/year/all-time totals
+  playtime.py summary        rewrite the summary file the Noctalia panel reads
+  playtime.py import         reread Steam's and Prism's own playtime totals
+  playtime.py backup         write a local backup of the history now
+  playtime.py restore FILE   merge a backup (or any playtime.db) into the history
+  playtime.py deploy-server  copy server.py to the server
 
 Games are found by scanning /proc. Steam games run under Steam's `reaper
 SteamLaunch AppId=N` process, Prism Launcher's Minecraft runs as java with
@@ -41,11 +43,13 @@ CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "playt
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share")) / "playtime"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "playtime"
 DB_PATH = DATA_DIR / "playtime.db"
+BACKUP_DIR = DATA_DIR / "backups"
 SUMMARY_PATH = STATE_DIR / "summary.json"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
 DEFAULTS = {
-    "ssh_host": "oracle",
+    # Empty: local only, no server sync.
+    "ssh_host": "",
     "remote_dir": "playtime",
     "poll_seconds": 10,
     "sync_minutes": 15,
@@ -57,6 +61,8 @@ DEFAULTS = {
     # "application", "tool", "demo", ...). Apps like Wallpaper Engine are
     # "application" and would otherwise top the list.
     "import_steam_types": ["game"],
+    # Daily local backups of the history to keep; 0 turns them off.
+    "backup_keep": 7,
 }
 
 
@@ -69,6 +75,7 @@ def suspended_total():
 
 CHECKPOINT_SECONDS = 60
 SUMMARY_SECONDS = 60
+BACKUP_SECONDS = 24 * 3600
 
 STEAM_ROOTS = [
     HOME / ".local/share/Steam",
@@ -600,6 +607,10 @@ def import_totals(db, cfg, steam, running=()):
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
 
+def server_enabled(cfg):
+    return bool(cfg["ssh_host"])
+
+
 def ssh_base(cfg):
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=10", cfg["ssh_host"]]
@@ -652,11 +663,90 @@ def sync(db, cfg):
 
 
 def deploy_server(cfg):
+    """Returns an error string, or None on success (or with no server set)."""
+    if not server_enabled(cfg):
+        print("no server set (ssh_host is empty), nothing to deploy")
+        return None
     remote = cfg["remote_dir"].rstrip("/")
-    subprocess.run(ssh_base(cfg) + [f"mkdir -p {remote}"], check=True)
-    with open(SERVER_SCRIPT, "rb") as f:
-        subprocess.run(ssh_base(cfg) + [f"cat > {remote}/server.py"], stdin=f, check=True)
+    try:
+        subprocess.run(ssh_base(cfg) + [f"mkdir -p {remote}"],
+                       capture_output=True, text=True, timeout=60, check=True)
+        with open(SERVER_SCRIPT, "rb") as f:
+            subprocess.run(ssh_base(cfg) + [f"cat > {remote}/server.py"],
+                           stdin=f, capture_output=True, timeout=60, check=True)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        lines = stderr.strip().splitlines()
+        return f"deploy failed: {lines[-1] if lines else f'exit {e.returncode}'}"
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"deploy failed: {e}"
     print(f"server.py copied to {cfg['ssh_host']}:{remote}/")
+    return None
+
+
+# ── Local backups ────────────────────────────────────────────────────────────
+
+BACKUP_NAME = re.compile(r"playtime-\d{4}-\d{2}-\d{2}\.db")
+
+
+def backup_files():
+    """Our own backups, oldest first (the date in the name sorts)."""
+    if not BACKUP_DIR.is_dir():
+        return []
+    return sorted(p for p in BACKUP_DIR.iterdir() if BACKUP_NAME.fullmatch(p.name))
+
+
+def last_backup():
+    """Epoch of the newest backup, 0 if none. Taken from the files, so
+    deleting the folder simply starts over."""
+    files = backup_files()
+    return int(files[-1].stat().st_mtime) if files else 0
+
+
+def backup(db, keep):
+    """Snapshot the history to backups/playtime-<date>.db (one per day, the
+    latest wins) and drop all but the newest `keep` (None keeps all).
+    Returns the path."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUP_DIR / f"playtime-{dt.date.today().isoformat()}.db"
+    tmp = dest.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    out = sqlite3.connect(tmp)
+    try:
+        db.backup(out)
+    finally:
+        out.close()
+    # Never leave a half-written file under a backup's name.
+    tmp.replace(dest)
+    if keep:
+        files = backup_files()
+        for old in files[:max(0, len(files) - keep)]:
+            old.unlink()
+    return dest
+
+
+def restore(db, path):
+    """Merge sessions and imported totals from another playtime database into
+    this one. Same upserts as sync, so nothing newer is lost and restoring
+    twice changes nothing. Returns (sessions, imported) row counts read."""
+    if not Path(path).is_file():
+        raise ValueError(f"{path} is not a file")
+    src = sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "sessions" not in tables:
+            raise ValueError(f"{path} is not a playtime database (no sessions table)")
+        rows = [dict(r) for r in src.execute(f"SELECT {', '.join(FIELDS)} FROM sessions")]
+        imported = ([dict(r) for r in src.execute(
+            f"SELECT {', '.join(IMPORTED_FIELDS)} FROM imported")]
+            if "imported" in tables else [])
+    finally:
+        src.close()
+    db.executemany(UPSERT, rows)
+    db.executemany(UPSERT_IMPORTED, imported)
+    db.commit()
+    return len(rows), len(imported)
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────
@@ -791,9 +881,12 @@ def write_summary(db, live_sessions, cfg):
                  for s in live_sessions],
         "periods": summarize(db, live_sessions, cfg["import_steam_types"]),
         "sync": {
+            "enabled": server_enabled(cfg),
             "ok": int(get_meta(db, "sync_ok") or 0),
-            "error": get_meta(db, "sync_error") or "",
+            # An error from before the server was turned off is not news.
+            "error": (get_meta(db, "sync_error") or "") if server_enabled(cfg) else "",
         },
+        "backup": {"ok": last_backup()},
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = SUMMARY_PATH.with_suffix(".tmp")
@@ -820,6 +913,25 @@ def print_stats(db, cfg, limit=25):
             print(f"  {fmt(g['seconds']):>9}  {g['name']}")
             for d in g["details"]:
                 print(f"  {'':>9}    {fmt(d['seconds'])}  {d['name']}")
+    print()
+    print(f"History: {DB_PATH}")
+    b = last_backup()
+    print(f"Backup:  {ago(b) if b else 'none yet'}"
+          + (f", {len(backup_files())} kept in {BACKUP_DIR}" if b else ""))
+    if not server_enabled(cfg):
+        print("Server:  off (ssh_host is empty), local only")
+    else:
+        ok, err = int(get_meta(db, "sync_ok") or 0), get_meta(db, "sync_error") or ""
+        print(f"Server:  {cfg['ssh_host']}, "
+              + (f"last sync {ago(ok)}" if ok else "never synced")
+              + (f"; {err}" if err else ""))
+
+
+def ago(epoch):
+    s = max(0, int(time.time()) - epoch)
+    if s < 60:
+        return "just now"
+    return f"{fmt(s)} ago" if s < 86400 else f"{s // 86400} days ago"
 
 
 # ── Daemon ───────────────────────────────────────────────────────────────────
@@ -899,7 +1011,11 @@ def run():
     last_suspended = suspended_total()
     last_checkpoint = last_summary = 0
     next_sync = 0  # sync right away, which also restores history after a reinstall
-    log(f"playtime running, db {DB_PATH}, server {cfg['ssh_host']}")
+    server = server_enabled(cfg)
+    keep = cfg["backup_keep"]
+    next_backup = 0 if keep > 0 else float("inf")
+    log(f"playtime running, db {DB_PATH}, "
+        + (f"server {cfg['ssh_host']}" if server else "local only (no ssh_host)"))
 
     # Names of played Steam apps that no local cache knows come from the
     # store, slowly, in the background; the next import picks them up.
@@ -949,11 +1065,22 @@ def run():
                 import_totals(db, cfg, steam, set(tracker.active))
             except Exception as e:  # a half-written Steam file must not stop tracking
                 log(f"import failed: {e!r}")
-            err = sync(db, cfg)
-            if err:
-                log(err)
+            if server:
+                err = sync(db, cfg)
+                if err:
+                    log(err)
             next_sync = now + sync_every
             last_summary = 0
+
+        if now >= next_backup:
+            # Due a day after the newest backup, so restarts do not add more.
+            if now - last_backup() >= BACKUP_SECONDS:
+                tracker.checkpoint()
+                try:
+                    backup(db, keep)
+                except (OSError, sqlite3.Error) as e:
+                    log(f"backup failed: {e!r}")
+            next_backup = now + 3600
 
         if now - last_summary >= SUMMARY_SECONDS:
             write_summary(db, tracker.live(), cfg)
@@ -966,9 +1093,10 @@ def run():
 
     tracker.close_all()
     write_summary(db, [], cfg)
-    err = sync(db, cfg)
-    if err:
-        log(err)
+    if server:
+        err = sync(db, cfg)
+        if err:
+            log(err)
     log("playtime stopped")
 
 
@@ -978,6 +1106,8 @@ def main():
         run()
     elif cmd == "sync":
         db, cfg = open_db(), load_config()
+        if not server_enabled(cfg):
+            sys.exit(f"no server set: add ssh_host to {CONFIG_PATH}")
         err = sync(db, cfg)
         write_summary(db, [], cfg)
         if err:
@@ -998,8 +1128,23 @@ def main():
         if missing:
             print(f"{len(missing)} Steam app names unknown locally; the daemon looks them up")
         write_summary(db, [], cfg)
+    elif cmd == "backup":
+        cfg = load_config()
+        print(f"backed up to {backup(open_db(), cfg['backup_keep'] or None)}")
+    elif cmd == "restore":
+        if len(sys.argv) < 3:
+            sys.exit("usage: playtime restore FILE")
+        db, cfg = open_db(), load_config()
+        try:
+            n, m = restore(db, sys.argv[2])
+        except (ValueError, sqlite3.Error) as e:
+            sys.exit(f"restore failed: {e}")
+        write_summary(db, [], cfg)
+        print(f"merged {n} sessions and {m} imported totals from {sys.argv[2]}")
     elif cmd == "deploy-server":
-        deploy_server(load_config())
+        err = deploy_server(load_config())
+        if err:
+            sys.exit(err)
     else:
         sys.exit(__doc__)
 

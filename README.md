@@ -1,7 +1,8 @@
 # playtime
 
-Tracks how long you play games on Linux and keeps the history on your own
-server over SSH, so it survives a reinstall or a distro swap. A Noctalia bar
+Tracks how long you play games on Linux. The history lives in a local SQLite
+file with daily local backups; optionally it is mirrored to your own server
+over SSH, so it survives a reinstall or a distro swap. A Noctalia bar
 widget shows today's total; its panel shows day, week, month, year and
 all-time stats per game. All time also includes everything Steam and Prism
 Launcher recorded before tracking started.
@@ -36,7 +37,16 @@ Launcher recorded before tracking started.
     slowly once in the background and cached.
   - Only Steam apps of type `game` count by default, so tools like Wallpaper
     Engine stay out; see `import_steam_types`.
-- **Sync**: `ssh <host> python3 playtime/server.py ...` sends every local
+- **Local history**: every session is written to
+  `~/.local/share/playtime/playtime.db` first; everything works from that
+  file, with or without a server.
+- **Local backups**: once a day the daemon copies the history (SQLite's online
+  backup) to `~/.local/share/playtime/backups/playtime-<date>.db` and keeps
+  the newest `backup_keep` (default 7). `playtime restore <file>` merges a
+  backup back in with the same upserts as sync, so it never loses newer
+  sessions and running it twice changes nothing.
+- **Sync** (optional, when `ssh_host` is set):
+  `ssh <host> python3 playtime/server.py ...` sends every local
   session and imported total and gets every stored one back; both sides
   upsert by key, so syncing twice never duplicates anything. It runs at start, after each
   session and every 15 minutes, and retries later when offline. No port or
@@ -47,30 +57,35 @@ Launcher recorded before tracking started.
 
 ## Install
 
-Requires Python 3.11+ locally, an SSH host alias whose key works without a
-prompt (the daemon uses `BatchMode`), and Python 3.9+ on the server.
+Requires Python 3.11+. For the optional server backup: an SSH host alias
+whose key works without a prompt (the daemon uses `BatchMode`) and Python
+3.9+ on the server.
 
 ```sh
 ./install.sh                      # daemon + systemd user service
 ./install.sh ~/path/to/plugins    # also copy the Noctalia plugin into a local plugin source
 ```
 
-`install.sh` also copies `server.py` to the server, so both sides always
-speak the same sync format.
+When a server is set, `install.sh` also copies `server.py` to it, so both
+sides always speak the same sync format.
 
-Edit `~/.config/playtime/config.toml` (from `config.example.toml`) to set the
-SSH host and add rules for non-Steam games.
+Edit `~/.config/playtime/config.toml` (from `config.example.toml`) to add rules
+for non-Steam games and, optionally, set `ssh_host`. With `ssh_host` empty
+(the default) everything stays local.
 
-After a reinstall: restore the SSH key, run `./install.sh`, and the first sync
-pulls the full history back.
+After a reinstall: with a server, restore the SSH key, run `./install.sh`, and
+the first sync pulls the full history back. Without one, run `./install.sh`
+and `playtime restore <copy of playtime.db or a backup>`.
 
 ## Commands
 
 ```
-playtime stats          totals per period and game
-playtime sync           sync now
+playtime stats          totals per period and game, backup and sync status
+playtime sync           sync with the server now
 playtime import         reread Steam's and Prism's totals now
 playtime summary        rewrite the panel's summary file
+playtime backup         write a local backup now
+playtime restore FILE   merge a backup (or any playtime.db) into the history
 playtime deploy-server  copy server.py to the server
 ```
 

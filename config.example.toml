@@ -1,10 +1,16 @@
 # playtime config: ~/.config/playtime/config.toml
 
-# SSH host alias (from ~/.ssh/config) that keeps the history. The key must
-# work without a passphrase prompt: the daemon runs ssh in BatchMode.
-ssh_host = "oracle"
+# The history lives in ~/.local/share/playtime/playtime.db and works without
+# a server. To also mirror it to one, set an SSH host alias (from
+# ~/.ssh/config) here, e.g. "myserver". The key must work without a passphrase
+# prompt: the daemon runs ssh in BatchMode. Empty: local only.
+ssh_host = ""
 # Directory on the server, relative to the SSH user's home.
 remote_dir = "playtime"
+
+# Daily copies of the history in ~/.local/share/playtime/backups/; how many
+# to keep. 0 turns them off.
+backup_keep = 7
 
 poll_seconds = 10
 sync_minutes = 15
