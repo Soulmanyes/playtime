@@ -94,6 +94,48 @@ playtime deploy-server  copy server.py to the server
 CachyOS (Hyprland, Noctalia v5), Steam native + Proton, Prism Launcher;
 server on Oracle Linux 9 (Python 3.9, SQLite 3.34).
 
+## Known issues
+
+### Prism playtime resets
+
+Prism keeps each instance's total in `instances/<folder>/instance.cfg`
+(`totalTimePlayed`). The import treats a newer cutoff as a newer total, so
+when Prism's own total for an instance goes **down**, the all-time baseline
+goes down with it. Not fixed yet.
+
+When Prism's total can reset:
+
+- The OS is reinstalled, or `~/.local/share/PrismLauncher` is deleted,
+  without restoring the instances folder.
+- Switching between the native package and the Flatpak. They use different
+  data folders, so instances added in the new one start at 0.
+- Uninstalling the Flatpak with `--delete-data`. Removing or reinstalling
+  the native package keeps the data.
+- A modpack is deleted and installed again under the **same** folder name.
+- `RecordGameTime` or a per-instance `OverrideGameTime` is changed. Turned
+  off, Prism stops counting; the total does not drop, but it misses time.
+
+What happens then: the next import sees a newer cutoff and replaces the old
+total (for example 761 h of GTNH) with the new small one. Tracked sessions
+between the old and the new cutoff are skipped too, because the code assumes
+the new total already contains them. The server and the local backups do not
+help: sync and `playtime restore` use the same upsert, so the older, bigger
+row loses to the newer one there too.
+
+Cases that are fine:
+
+- A new instance under a **new** folder name (for example a GTNH update
+  installed as a new instance). It gets its own key, and the old row stays.
+- Prism crashing before it saves the total. Prism's total is lower, but the
+  tracked session still counts after the old cutoff.
+
+Double counting: Prism's copy dialog has a **Keep play time** option. A copy
+made with it counts the same hours again under a second key.
+
+Possible fix: when an import has a newer cutoff but fewer seconds than the
+stored row, treat it as a reset. Keep the old baseline, and add the new
+total on top of the tracked time up to the reset.
+
 ## License
 
 CC0 1.0. No third-party code; Python standard library only.
