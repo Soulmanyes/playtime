@@ -16,6 +16,8 @@
     "synced": "Synced {ago}",
     "never-synced": "Not synced yet",
     "sync-error": "Sync error: {error}",
+    "local-only": "Saved locally, no server set",
+    "local-only-backup": "Saved locally, backed up {ago}",
     "stale": "Data is {ago} old: the daemon may be stopped"
   }
 }
