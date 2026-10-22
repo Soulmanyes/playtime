@@ -1,0 +1,67 @@
+# playtime
+
+Tracks how long you play games on Linux and keeps the history on your own
+server over SSH, so it survives a reinstall or a distro swap. A Noctalia bar
+widget shows today's total; its panel shows day, week, month, year and
+all-time stats per game.
+
+## How it works
+
+- **Daemon** (`playtime.py run`, systemd user service) scans `/proc` every
+  10 s. It has no hooks into games and costs well under 0.1% CPU and about
+  15 MB RAM.
+  - **Steam** games (native and Proton) are found through Steam's
+    `reaper SteamLaunch AppId=N` process; names come from the local
+    `appmanifest_*.acf` files of every Steam library. Proton, Steam Linux
+    Runtime and redistributables are skipped.
+  - **Minecraft** through Prism Launcher is found by the game's java process
+    (`org.prismlauncher.EntryPoint`, so the launcher alone does not count);
+    the instance name is recorded too.
+  - **Other games** come from `[[game]]` rules in the config (executable
+    name or command-line regex).
+- Sessions shorter than 60 s are dropped. A running session is saved every
+  minute, so a crash loses at most a minute. A gap between polls (suspend)
+  ends the session at the last time the game was seen.
+- **Sync**: `ssh <host> python3 playtime/server.py ...` sends every local
+  session and gets every stored one back; both sides upsert by session id,
+  so syncing twice never duplicates anything. It runs at start, after each
+  session and every 15 minutes, and retries later when offline. No port or
+  web service is opened on the server; it only needs Python 3.9+.
+- **Noctalia plugin** (`noctalia/`) only reads
+  `~/.local/state/playtime/summary.json`, which the daemon rewrites once a
+  minute, so several bars cost nothing extra.
+
+## Install
+
+Requires Python 3.11+ locally, an SSH host alias whose key works without a
+prompt (the daemon uses `BatchMode`), and Python 3.9+ on the server.
+
+```sh
+./install.sh                      # daemon + systemd user service
+./install.sh ~/path/to/plugins    # also copy the Noctalia plugin into a local plugin source
+playtime deploy-server            # once: copy server.py to the server
+```
+
+Edit `~/.config/playtime/config.toml` (from `config.example.toml`) to set the
+SSH host and add rules for non-Steam games.
+
+After a reinstall: restore the SSH key, run `./install.sh`, and the first sync
+pulls the full history back.
+
+## Commands
+
+```
+playtime stats          totals per period and game
+playtime sync           sync now
+playtime summary        rewrite the panel's summary file
+playtime deploy-server  copy server.py to the server
+```
+
+## Tested
+
+CachyOS (Hyprland, Noctalia v5), Steam native + Proton, Prism Launcher;
+server on Oracle Linux 9 (Python 3.9, SQLite 3.34).
+
+## License
+
+CC0 1.0. No third-party code; Python standard library only.

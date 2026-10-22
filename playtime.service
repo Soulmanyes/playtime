@@ -1,0 +1,12 @@
+[Unit]
+Description=Playtime game tracker
+
+[Service]
+ExecStart=/usr/bin/python3 -I %h/.local/lib/playtime/playtime.py run
+Restart=on-failure
+RestartSec=30
+# Stopping closes open sessions and does one last sync (60 s SSH timeout).
+TimeoutStopSec=75
+
+[Install]
+WantedBy=default.target
