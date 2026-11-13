@@ -1,12 +1,15 @@
 --!nonstrict
 -- Playtime panel: tabs for day/week/month/year/all time, a bar chart of the
 -- period's buckets (hours, days, months or years) and per-game totals.
+-- Clicking a game opens its own chart, starting at this year; clicking a bar
+-- drills down to month and day (see history.luau).
 
 local shared = require("./shared.luau")
+local history = require("./history.luau")
 
 local TABS = { "day", "week", "month", "year", "all" }
-local CHART_HEIGHT = 72
-local CHART_WIDTH = 380
+local CHART_HEIGHT = 180
+local CHART_WIDTH = 840
 -- Sparse x labels so 24 hours or 31 days stay readable.
 local LABEL_EVERY = { day = 6, week = 1, month = 5, year = 1, all = 1 }
 -- All time holds every Steam game ever played; a full list is slow to render.
@@ -14,6 +17,29 @@ local MAX_GAMES = 50
 
 local data = nil
 local open = false
+-- Game view: the selected game ({ key, name }), the shown period and the
+-- daemon's history.json. nil selected = the normal per-period list.
+local selected = nil
+local view = nil
+local hist = nil
+-- Key of the clickable node under the pointer (game row or chart bar).
+local hovered = nil
+
+-- onHover handler that tracks `hovered` and redraws when it changes. Hover
+-- styles must switch to an explicit idle value (e.g. a clear fill), never nil:
+-- a nil prop keeps the node's previous value, so the highlight would stick.
+local function hover(key)
+  return function(state)
+    if state == "true" or state == true then
+      hovered = key
+    elseif hovered == key then
+      hovered = nil
+    else
+      return
+    end
+    render()
+  end
+end
 
 local function currentTab()
   local t = noctalia.state.get("tab")
@@ -25,65 +51,143 @@ local function currentTab()
   return "week"
 end
 
-local function tabRow(selected)
+-- Clickable things use Noctalia's own buttons, which bring their hover and
+-- press states; the selected tab is the filled primary one.
+local function tabRow(current)
   local tabs = {}
   for _, name in ipairs(TABS) do
-    local active = name == selected
-    tabs[#tabs + 1] = ui.row({
-      key = "tab-" .. name,
-      align = "center",
-      justify = "center",
+    local active = name == current
+    tabs[#tabs + 1] = ui.button({
+      -- The state is in the key so the button is rebuilt with its new look.
+      key = "tab-" .. name .. (active and "-on" or ""),
+      text = noctalia.tr("ui.tab-" .. name),
+      variant = active and "primary" or "outline",
       flexGrow = 1,
-      minHeight = 30,
-      paddingH = 8,
-      radius = 8,
-      fill = active and "primary/0.14" or "surface_variant/0.22",
-      border = active and "primary/0.45" or "outline/0.08",
-      borderWidth = 1,
       onClick = function()
         noctalia.state.set("tab", name)
         render()
       end,
-    }, {
-      ui.label({ text = noctalia.tr("ui.tab-" .. name), fontSize = 12,
-                 fontWeight = active and "bold" or "normal",
-                 color = active and "on_surface" or "on_surface_variant" }),
     })
   end
   return ui.row({ gap = 4 }, tabs)
 end
 
-local function chart(tab, buckets)
-  local peak = 1
+-- Y-axis steps: round minutes, then round hours, then 1/2/5 x 10^k hours.
+local STEPS = { 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400 }
+local MAX_TICKS = 4
+local LABEL_H = 18 -- every axis label sits in a box this tall, so rows line up
+local Y_AXIS_W = 44
+
+-- The smallest round step that covers `peak` in at most MAX_TICKS steps.
+local function axisStep(peak)
+  for _, step in ipairs(STEPS) do
+    if peak <= step * MAX_TICKS then
+      return step
+    end
+  end
+  local step = 100 * 3600
+  while true do
+    for _, f in ipairs({ 1, 2, 5 }) do
+      if peak <= f * step * MAX_TICKS then
+        return f * step
+      end
+    end
+    step = step * 10
+  end
+end
+
+-- "0", "30m", "1h", "1h30".
+local function tickLabel(seconds)
+  local m = math.floor(seconds / 60)
+  local h = math.floor(m / 60)
+  m = m % 60
+  if h == 0 then
+    return m == 0 and "0" or tostring(m) .. "m"
+  end
+  return m == 0 and tostring(h) .. "h" or string.format("%dh%02d", h, m)
+end
+
+local function axisLabel(text, width, align)
+  return ui.row({ width = width, height = LABEL_H, align = "center", justify = align, flexShrink = 0 }, {
+    ui.label({ text = text, fontSize = 11, color = "on_surface_variant", maxLines = 1 }),
+  })
+end
+
+-- Bar chart with a time y-axis (round ticks, bars scaled to the top tick) and
+-- the bucket labels as x-axis. onBar(i), when given, makes each bar
+-- clickable. Every height is fixed, so tick labels centre on their values:
+--   y-axis column:  tick 0 .. tick K, LABEL_H boxes spaced CHART_HEIGHT / K
+--   plot column:    LABEL_H / 2 top pad, bars, 1 px baseline, x labels
+-- X labels sit in boxes as wide as the bars, so each column is as wide as its
+-- bar's and the labels stay under their bars.
+local function chart(tab, buckets, onBar)
+  local peak = 0
   for _, b in ipairs(buckets) do
     peak = math.max(peak, tonumber(b.seconds) or 0)
   end
+  local step = axisStep(math.max(peak, 1))
+  local ticks = math.max(1, math.ceil(peak / step))
+  local top = step * ticks
   local n = math.max(1, #buckets)
-  local barWidth = math.max(4, math.min(28, math.floor(CHART_WIDTH / n) - 3))
+  local barWidth = math.max(6, math.min(40, math.floor((CHART_WIDTH - Y_AXIS_W) / n) - 3))
   local every = LABEL_EVERY[tab] or 1
-  local cols = {}
+
+  local bars, xLabels = {}, {}
   for i, b in ipairs(buckets) do
     local seconds = tonumber(b.seconds) or 0
-    local showLabel = (i - 1) % every == 0
-    cols[#cols + 1] = ui.column({
-      key = "bar-" .. tostring(i),
-      gap = 4,
+    local key = "bar-" .. tab .. "-" .. tostring(i)
+    -- Clickable bars light up under the pointer, column and bar both.
+    local lit = onBar ~= nil and hovered == key
+    bars[#bars + 1] = ui.column({
+      key = key,
       align = "center",
       flexGrow = 1,
+      height = CHART_HEIGHT,
+      radius = 4,
+      fill = lit and "on_surface/0.10" or "on_surface/0",
       tooltip = tostring(b.label) .. " · " .. shared.duration(seconds),
+      onHover = onBar and hover(key) or nil,
+      onClick = onBar and function()
+        onBar(i)
+      end or nil,
     }, {
       ui.spacer({ flexGrow = 1 }),
       ui.box({
         width = barWidth,
-        height = seconds > 0 and math.max(3, math.floor(CHART_HEIGHT * seconds / peak)) or 2,
-        radius = 3,
-        fill = seconds > 0 and "primary" or "outline/0.2",
+        flexShrink = 0,
+        height = seconds > 0 and math.max(3, math.floor(CHART_HEIGHT * seconds / top)) or 0,
+        radius = 4,
+        fill = lit and "secondary" or "primary",
       }),
-      ui.label({ text = showLabel and tostring(b.label) or " ", fontSize = 10,
-                 color = "on_surface_variant" }),
+    })
+    xLabels[#xLabels + 1] = ui.column({ key = "x-" .. tab .. "-" .. tostring(i), align = "center", flexGrow = 1 }, {
+      axisLabel((i - 1) % every == 0 and tostring(b.label) or " ", barWidth, "center"),
     })
   end
-  return ui.row({ gap = 2, height = CHART_HEIGHT + 22 }, cols)
+
+  local yTicks = {}
+  for k = ticks, 0, -1 do
+    yTicks[#yTicks + 1] = axisLabel(tickLabel(k * step), Y_AXIS_W, "end")
+    if k > 0 then
+      yTicks[#yTicks + 1] = ui.spacer({ height = CHART_HEIGHT / ticks - LABEL_H, flexShrink = 0, flexGrow = 0 })
+    end
+  end
+
+  return ui.row({ gap = 6, align = "start" }, {
+    ui.column({ width = Y_AXIS_W, flexShrink = 0 }, yTicks),
+    ui.column({ flexGrow = 1, align = "stretch" }, {
+      ui.spacer({ height = LABEL_H / 2, flexShrink = 0, flexGrow = 0 }),
+      ui.row({ height = CHART_HEIGHT, align = "end" }, {
+        ui.box({ width = 1, height = CHART_HEIGHT, flexShrink = 0, fill = "outline/0.5" }),
+        ui.row({ gap = 2, flexGrow = 1, height = CHART_HEIGHT, align = "end" }, bars),
+      }),
+      ui.box({ height = 1, flexShrink = 0, fill = "outline/0.5" }),
+      ui.row({}, {
+        ui.spacer({ width = 1, flexShrink = 0, flexGrow = 0 }),
+        ui.row({ gap = 2, flexGrow = 1 }, xLabels),
+      }),
+    }),
+  })
 end
 
 local function gameRow(game, total)
@@ -97,13 +201,30 @@ local function gameRow(game, total)
       ui.label({ text = tostring(game.name), fontSize = 13, flexGrow = 1, maxLines = 1 }),
       ui.label({ text = shared.duration(seconds), fontSize = 13, fontWeight = "bold" }),
     }),
-    ui.progress({ progress = total > 0 and seconds / total or 0, height = 5, radius = 2 }),
+    ui.progress({ progress = total > 0 and seconds / total or 0, height = 5, radius = 2,
+                  track = "on_surface/0.22" }),
   }
   if #details > 0 then
     children[#children + 1] = ui.label({ text = table.concat(details, "   "), fontSize = 11,
                                          color = "on_surface_variant", maxLines = 2 })
   end
-  return ui.column({ key = "game-" .. tostring(game.name), gap = 4 }, children)
+  local key = "game-" .. tostring(game.key or game.name)
+  local lit = hovered == key
+  -- The border is always there (clear when idle) so hovering doesn't shift rows.
+  return ui.column({
+    key = key,
+    gap = 4,
+    paddingH = 8,
+    paddingV = 6,
+    radius = 8,
+    fill = lit and "surface_variant/0.9" or "surface_variant/0",
+    border = lit and "primary/0.85" or "outline/0",
+    borderWidth = 1,
+    onHover = hover(key),
+    onClick = function()
+      selectGame(game)
+    end,
+  }, children)
 end
 
 local function footer()
@@ -132,6 +253,92 @@ local function footer()
   return ui.column({ gap = 2 }, rows)
 end
 
+local function loadHistory()
+  shared.readHistory(function(h)
+    hist = h
+    render()
+  end, hist)
+end
+
+function selectGame(game)
+  selected = { key = tostring(game.key or game.name), name = tostring(game.name) }
+  view = history.today("year")
+  loadHistory()
+  render()
+end
+
+local function leaveGame()
+  selected, view = nil, nil
+  render()
+end
+
+local function goUp()
+  local up = history.parent(view)
+  if up then
+    view = up
+    render()
+  else
+    leaveGame()
+  end
+end
+
+local function navButton(key, glyph, onClick)
+  return ui.button({ key = key, glyph = glyph, variant = "default", onClick = onClick })
+end
+
+local function gameView(header)
+  local game = hist and hist.games and hist.games[selected.key] or {}
+  local edges, labels, children = history.layout(view)
+  local seconds = history.buckets(game.spans, edges)
+  local buckets, total = {}, 0
+  for i, s in ipairs(seconds) do
+    buckets[i] = { label = labels[i], seconds = s }
+    total = total + s
+  end
+  local up = history.parent(view)
+  local body = {
+    header,
+    ui.row({ align = "center", gap = 6 }, {
+      ui.button({ key = "up-" .. view.level, glyph = "chevron-left", variant = "default",
+                  text = up and history.title(up) or noctalia.tr("ui.all-games"), onClick = goUp }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.label({ text = tostring(game.name or selected.name), fontSize = 14, fontWeight = "bold", maxLines = 1 }),
+    }),
+    ui.row({ align = "center", gap = 6 }, {
+      navButton("prev", "chevron-left", function()
+        view = history.shift(view, -1)
+        render()
+      end),
+      ui.label({ text = history.title(view), fontSize = 13, flexGrow = 1,
+                 textAlign = "center" }),
+      navButton("next", "chevron-right", function()
+        view = history.shift(view, 1)
+        render()
+      end),
+    }),
+    ui.row({ align = "center" }, {
+      ui.label({ text = noctalia.tr("ui.total"), color = "on_surface_variant", flexGrow = 1 }),
+      ui.label({ text = shared.duration(total), fontSize = 18, fontWeight = "bold" }),
+    }),
+    chart(view.level, buckets, children[1] and function(i)
+      view = children[i]
+      render()
+    end or nil),
+  }
+  if hist == nil then
+    body[#body + 1] = ui.label({ text = noctalia.tr("ui.no-history"), fontSize = 11,
+                                 color = "on_surface_variant" })
+  end
+  local untracked = tonumber(game.untracked) or 0
+  if untracked > 0 then
+    body[#body + 1] = ui.label({ text = noctalia.tr("ui.untracked", { time = shared.duration(untracked) }),
+                                 fontSize = 11, color = "on_surface_variant", maxLines = 3 })
+  end
+  body[#body + 1] = ui.spacer({ flexGrow = 1 })
+  body[#body + 1] = footer()
+  panel.render(ui.column({ gap = 12, padding = 16, flexGrow = 1, align = "stretch" }, body))
+end
+
 function render()
   if not open then
     return
@@ -146,6 +353,10 @@ function render()
       header,
       ui.label({ text = noctalia.tr("ui.no-data"), color = "on_surface_variant" }),
     }))
+    return
+  end
+  if selected then
+    gameView(header)
     return
   end
 
@@ -199,13 +410,29 @@ local function refresh()
     data = d
     render()
   end, data)
+  if selected then
+    loadHistory()
+  end
 end
 
--- `noctalia msg panel-open soulmanyes/playtime:panel all` opens on a tab.
+-- `noctalia msg panel-open soulmanyes/playtime:panel all` opens on a tab;
+-- `... "game steam:240 day 2026-11-13"` opens a game view (level and date
+-- optional), with the key as history.json and summary.json give it.
 function onOpen(context)
   for _, name in ipairs(TABS) do
     if context == name then
       noctalia.state.set("tab", name)
+    end
+  end
+  local key, level, y, m, d = tostring(context or ""):match(
+    "^game%s+(%S+)%s*(%a*)%s*(%d*)%-?(%d*)%-?(%d*)$")
+  if key then
+    selectGame({ key = key, name = key })
+    if table.find(history.LEVELS, level) then
+      view.level = level
+    end
+    if y ~= "" and m ~= "" and d ~= "" then
+      view.y, view.m, view.d = tonumber(y), tonumber(m), tonumber(d)
     end
   end
   open = true
@@ -225,6 +452,8 @@ end
 
 function onClose()
   open = false
+  -- Reopening starts on the list again.
+  selected, view = nil, nil
   panel.setWantsSecondTicks(false)
 end
 
@@ -233,6 +462,16 @@ function onKey(chord, pressed)
     return
   end
   local key = tostring(chord or ""):lower()
+  -- In a game view Escape goes up a level and the arrows move the period.
+  if selected then
+    if key == "escape" then
+      goUp()
+    elseif key == "left" or key == "right" then
+      view = history.shift(view, key == "left" and -1 or 1)
+      render()
+    end
+    return
+  end
   if key == "escape" then
     panel.close()
   elseif key == "left" or key == "right" then

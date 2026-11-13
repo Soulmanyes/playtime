@@ -45,6 +45,9 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / 
 DB_PATH = DATA_DIR / "playtime.db"
 BACKUP_DIR = DATA_DIR / "backups"
 SUMMARY_PATH = STATE_DIR / "summary.json"
+# Per-game session spans for the panel's drill-down chart. A separate file so
+# the bar widget, which reads the summary every minute, never parses it.
+HISTORY_PATH = STATE_DIR / "history.json"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
 DEFAULTS = {
@@ -930,6 +933,18 @@ def imported_rows(db, import_types):
             and not (kinds.get(r["key"]) and kinds[r["key"]] not in types)]
 
 
+def load_sessions(db, live=()):
+    """Every stored session by id, with `live` ones merged in or extended."""
+    sessions = {r["id"]: dict(r) for r in db.execute(
+        "SELECT id, game_key, game_name, detail, start, end FROM sessions")}
+    for s in live:
+        if s.get("id") in sessions:
+            sessions[s["id"]]["end"] = max(sessions[s["id"]]["end"], s["end"])
+        else:
+            sessions[s.get("id") or uuid.uuid4().hex] = dict(s)
+    return sessions
+
+
 def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     """Totals per period, per game and per bucket. `live` holds sessions not
     yet (fully) in the DB as dicts with game_key, game_name, detail, start, end.
@@ -938,13 +953,7 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     its baseline plus tracked time after the baseline's cutoff. The year bars
     show tracked time only; `before` is the rest of the all-time total."""
     now = dt.datetime.now()
-    sessions = {r["id"]: dict(r) for r in db.execute(
-        "SELECT id, game_key, game_name, detail, start, end FROM sessions")}
-    for s in live:
-        if s.get("id") in sessions:
-            sessions[s["id"]]["end"] = max(sessions[s["id"]]["end"], s["end"])
-        else:
-            sessions[s.get("id") or uuid.uuid4().hex] = dict(s)
+    sessions = load_sessions(db, live)
     first = min((s["start"] for s in sessions.values()), default=None)
     baselines = imported_rows(db, import_types)
     cutoffs = {b["key"]: b["cutoff"] for b in baselines}
@@ -957,7 +966,8 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
         games = {}
 
         def add(key, name, detail, seconds):
-            g = games.setdefault(group_key(key), {"name": name, "seconds": 0, "details": {}})
+            g = games.setdefault(group_key(key),
+                                 {"key": group_key(key), "name": name, "seconds": 0, "details": {}})
             if not key.startswith(("prism:", "minecraft")):
                 g["name"] = name
             g["seconds"] += seconds
@@ -983,7 +993,7 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
                 add(base["key"], base["game_name"], base["detail"], base["seconds"])
 
         game_list = sorted(
-            ({"name": g["name"], "seconds": g["seconds"],
+            ({"key": g["key"], "name": g["name"], "seconds": g["seconds"],
               "details": sorted(({"name": k, "seconds": v} for k, v in g["details"].items()),
                                 key=lambda d: -d["seconds"])}
              for g in games.values()),
@@ -997,6 +1007,35 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
         if all_time:
             periods[pname]["before"] = max(0, total - sum(buckets))
     return periods
+
+
+def history(db, live=(), import_types=DEFAULTS["import_steam_types"]):
+    """Per game group: tracked session spans [start, end] sorted by start, and
+    the imported baseline seconds, which have no dates and so no bars."""
+    out = {}
+
+    def game(key, name):
+        g = out.setdefault(group_key(key), {"name": name, "spans": [], "untracked": 0})
+        if not key.startswith(("prism:", "minecraft")):
+            g["name"] = name
+        return g
+
+    for s in load_sessions(db, live).values():
+        if s["end"] > s["start"]:
+            game(s["game_key"], s["game_name"])["spans"].append([s["start"], s["end"]])
+    for base in imported_rows(db, import_types):
+        game(base["key"], base["game_name"])["untracked"] += base["seconds"]
+    for g in out.values():
+        g["spans"].sort()
+    return out
+
+
+def write_json(path, data):
+    """Atomic replace, so a reader never sees half a file."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
 
 
 def write_summary(db, live_sessions, cfg):
@@ -1014,10 +1053,9 @@ def write_summary(db, live_sessions, cfg):
         },
         "backup": {"ok": last_backup()},
     }
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SUMMARY_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data))
-    tmp.replace(SUMMARY_PATH)
+    write_json(SUMMARY_PATH, data)
+    write_json(HISTORY_PATH, {"updated": now,
+                              "games": history(db, live_sessions, cfg["import_steam_types"])})
 
 
 def fmt(seconds):

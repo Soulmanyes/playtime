@@ -1,12 +1,12 @@
 id = "soulmanyes/playtime"
 name = "Playtime"
-version = "1.1.0"
+version = "1.2.0"
 # 32: container tooltips; also require (22) and readFileAsync (23).
 plugin_api = 32
 author = "soulmanyes"
 license = "CC0-1.0"
 icon = "device-gamepad-2"
-description = "Game playtime from the playtime daemon: today in the bar, day/week/month/year/all-time in the panel."
+description = "Game playtime from the playtime daemon: today in the bar, day/week/month/year/all-time in the panel; click a game for its own chart and click bars to drill down."
 tags = ["gaming", "bar", "panel"]
 dependencies = ["python3"]
 
@@ -17,8 +17,8 @@ entry = "bar.luau"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 420
-height = 560
+width = 900
+height = 760
 placement = "floating"
 position = "auto"
 open_near_click = true

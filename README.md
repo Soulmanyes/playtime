@@ -4,8 +4,10 @@ Tracks how long you play games on Linux. The history lives in a local SQLite
 file with daily local backups; optionally it is mirrored to your own server
 over SSH, so it survives a reinstall or a distro swap. A Noctalia bar
 widget shows today's total; its panel shows day, week, month, year and
-all-time stats per game. All time also includes everything Steam and Prism
-Launcher recorded before tracking started.
+all-time stats per game, as bar charts with a time y-axis on round ticks. All time also includes everything Steam and Prism
+Launcher recorded before tracking started. Clicking a game opens its own bar
+chart, starting at the current year; clicking a bar drills down from year to
+month, then to the clicked day by hour.
 
 ## How it works
 
@@ -54,6 +56,14 @@ Launcher recorded before tracking started.
 - **Noctalia plugin** (`noctalia/`) only reads
   `~/.local/state/playtime/summary.json`, which the daemon rewrites once a
   minute, so several bars cost nothing extra.
+  - The panel's per-game charts read `history.json` next to it: every tracked
+    session as a start/end pair per game, bucketed in the panel. Only tracked
+    time has dates; imported Steam and Prism totals show as a note under the
+    chart. A separate file keeps the bar widget's minutely read small.
+  - In a game view: the back button or Escape goes up a level (from the year
+    back to the list), the arrows or Left/Right move to the previous or next
+    period. `noctalia msg panel-open soulmanyes/playtime:panel "game steam:240
+    month 2026-11-01"` opens a game view directly (level and date optional).
 
 ## Install
 

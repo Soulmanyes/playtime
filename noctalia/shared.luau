@@ -9,17 +9,27 @@ if stateHome == nil or stateHome == "" then
   stateHome = "~/.local/state"
 end
 M.SUMMARY_PATH = stateHome .. "/playtime/summary.json"
+-- Per-game session spans; only the panel's game view reads it.
+M.HISTORY_PATH = stateHome .. "/playtime/history.json"
 
--- The daemon replaces the file by atomic rename, so a read never sees half a
+-- The daemon replaces its files by atomic rename, so a read never sees half a
 -- file; a missing or broken one keeps the previous data.
-function M.read(cb, previous)
-  local queued = noctalia.readFileAsync(M.SUMMARY_PATH, function(text)
+local function readJson(path, cb, previous)
+  local queued = noctalia.readFileAsync(path, function(text)
     local data = text and noctalia.json.decode(text)
     cb(type(data) == "table" and data or previous)
   end)
   if not queued then
     cb(previous)
   end
+end
+
+function M.read(cb, previous)
+  readJson(M.SUMMARY_PATH, cb, previous)
+end
+
+function M.readHistory(cb, previous)
+  readJson(M.HISTORY_PATH, cb, previous)
 end
 
 function M.duration(seconds)
