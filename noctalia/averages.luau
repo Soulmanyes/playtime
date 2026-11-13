@@ -32,6 +32,25 @@ function M.projected(avg, unit)
   return (tonumber(avg and avg.days) or 0) < unit.days
 end
 
+-- Weekday rows from the daemon (Monday first): { days, average } each.
+function M.weekdays(avg)
+  return (avg and avg.weekdays) or {}
+end
+
+-- How full a weekday's bar is: "day" = its average out of 24 hours,
+-- "week" = its share of the summed weekday averages (all seven add to 1).
+function M.weekdayBar(list, i, mode)
+  local seconds = tonumber(list[i] and list[i].average) or 0
+  if mode == "day" then
+    return math.min(1, seconds / 86400)
+  end
+  local sum = 0
+  for _, w in ipairs(list) do
+    sum = sum + (tonumber(w.average) or 0)
+  end
+  return sum > 0 and seconds / sum or 0
+end
+
 -- Whole days tracked, for the "based on N days" note.
 function M.days(avg)
   return math.floor(tonumber(avg and avg.days) or 0)

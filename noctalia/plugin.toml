@@ -1,6 +1,6 @@
 id = "soulmanyes/playtime"
 name = "Playtime"
-version = "1.4.1"
+version = "1.5.0"
 # 32: container tooltips; also require (22) and readFileAsync (23).
 plugin_api = 32
 author = "Soulmanyes"

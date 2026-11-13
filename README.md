@@ -8,11 +8,12 @@ all-time stats per game, as bar charts with a time y-axis on round ticks. All ti
 Launcher recorded before tracking started. Clicking a game opens its own bar
 chart, starting at the current year; clicking a bar drills down from year to
 month, then to the clicked day by hour. The Averages tab shows average playtime
-per day, week, month and year, overall and per game, from tracked time.
+per day, week, month and year, overall and per game, from tracked time, and
+the average for each weekday (Monday to Sunday).
 
 ![Month view: a bar per day and the games played](screenshots/month.png)
 
-![Averages tab: per day, week, month and year, overall and per game](screenshots/averages.png)
+![Averages tab: per day, week, month and year, per weekday, and per game](screenshots/averages.png)
 
 ## How it works
 
@@ -69,7 +70,11 @@ per day, week, month and year, overall and per game, from tracked time.
     seconds overall and per game, and the days since the first tracked
     session. Each average is seconds / days x unit length (a month is 30.44
     days). A unit longer than the tracked span is marked "(projected)".
-    Imported totals have no dates, so they are left out.
+    Imported totals have no dates, so they are left out. `weekdays` holds
+    seven entries, Monday first: tracked seconds on that weekday (sessions
+    split at local midnight) divided by how many of that weekday fall between
+    the first session's date and today. The bar under each weekday is that
+    average out of 24 hours.
   - In a game view: the back button or Escape goes up a level (from the year
     back to the list), the arrows or Left/Right move to the previous or next
     period. `noctalia msg panel-open soulmanyes/playtime:panel "game steam:240

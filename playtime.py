@@ -1019,6 +1019,27 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     return periods
 
 
+def weekday_averages(sessions, first, now=None):
+    """Average tracked seconds on each weekday, Monday first: the time played
+    on that weekday (sessions split at local midnight) divided by how many of
+    that weekday fall between the first session's date and today, both
+    counted. Today counts as a whole day while it is still going."""
+    now = time.time() if now is None else now
+    seconds = [0.0] * 7
+    for s in sessions:
+        a, b = s["start"], min(s["end"], now)
+        while b > a:
+            day = dt.datetime.fromtimestamp(a).date()
+            midnight = dt.datetime.combine(day + dt.timedelta(days=1), dt.time()).timestamp()
+            cut = min(b, midnight)
+            seconds[day.weekday()] += cut - a
+            a = cut
+    start = dt.datetime.fromtimestamp(first).date()
+    span = (dt.datetime.fromtimestamp(now).date() - start).days + 1
+    counts = [span // 7 + (1 if (i - start.weekday()) % 7 < span % 7 else 0) for i in range(7)]
+    return [{"days": c, "average": seconds[i] / c if c else 0} for i, c in enumerate(counts)]
+
+
 def averages(db, live=()):
     """Tracked seconds overall and per game group, with the span they cover:
     from the first tracked session to now. The panel divides by `days` for
@@ -1040,6 +1061,7 @@ def averages(db, live=()):
         g["seconds"] += seconds
     game_list = sorted(games.values(), key=lambda g: -g["seconds"])
     return {"since": first,
+            "weekdays": weekday_averages(sessions.values(), first),
             # At least one day, so a first session doesn't blow up the rate.
             "days": max(1.0, (time.time() - first) / 86400),
             "total": sum(g["seconds"] for g in game_list),

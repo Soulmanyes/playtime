@@ -467,6 +467,30 @@ local function avgGameRow(game, avg)
   })
 end
 
+-- One column per weekday: name, average and a bar (see averages.weekdayBar).
+local WEEKDAY_BAR = "day"
+
+local function weekdayRow(avg)
+  local list = averages.weekdays(avg)
+  if #list ~= 7 then
+    return nil
+  end
+  local cells = {}
+  for i, w in ipairs(list) do
+    local seconds = tonumber(w.average) or 0
+    cells[#cells + 1] = ui.column({ key = "avg-wd-" .. i, flexGrow = 1, gap = 4, padding = 8, radius = 10,
+                                    fill = "surface_variant/0.9", border = "outline/0.6", borderWidth = 1 }, {
+      ui.label({ text = noctalia.tr("ui.wd-" .. i), fontSize = 11, color = "on_surface_variant" }),
+      ui.label({ text = shared.duration(seconds), fontSize = 14, fontWeight = "bold", maxLines = 1 }),
+      ui.progress({ progress = averages.weekdayBar(list, i, WEEKDAY_BAR), height = 5, radius = 2, track = "on_surface/0.22" }),
+    })
+  end
+  return ui.column({ gap = 6 }, {
+    ui.label({ text = noctalia.tr("ui.avg-weekdays"), fontSize = 11, color = "on_surface_variant" }),
+    ui.row({ gap = 6 }, cells),
+  })
+end
+
 local function averagesView(header)
   local avg = data.averages or {}
   local body = { header, tabRow("avg") }
@@ -482,6 +506,7 @@ local function averagesView(header)
     cards[#cards + 1] = avgCard(unit, avg)
   end
   body[#body + 1] = ui.row({ gap = 8 }, cards)
+  body[#body + 1] = weekdayRow(avg)
   body[#body + 1] = ui.label({ text = noctalia.tr("ui.avg-based", { days = averages.days(avg), since = since }),
                                fontSize = 11, color = "on_surface_variant", maxLines = 2 })
   local headerCells = avgCells(0, avg.days, { header = true })
