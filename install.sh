@@ -14,7 +14,12 @@ set -eu
 REPO=Soulmanyes/playtime
 PLUGIN_ID=soulmanyes/playtime
 SOURCE=playtime
-here=$(cd "$(dirname "$0")" && pwd)
+# Through curl | sh, $0 is the shell, not this file: always download then,
+# even when the current folder happens to hold a playtime.py.
+case $0 in
+    *install.sh) here=$(cd "$(dirname "$0")" && pwd) ;;
+    *) here= ;;
+esac
 lib="$HOME/.local/lib/playtime"
 bin="$HOME/.local/bin"
 units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
@@ -41,7 +46,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
-if [ ! -f "$here/playtime.py" ]; then
+if [ -z "$here" ] || [ ! -f "$here/playtime.py" ]; then
     # Run through curl | sh: download the latest release (main if there is none
     # yet) and run its own install.sh. releases/latest redirects to .../tag/<tag>
     tmp=$(mktemp -d)
