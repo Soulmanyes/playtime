@@ -31,6 +31,13 @@
     "avg-based": "Averages of tracked time over {days} days since {since}. Units longer than that are projected from those days. Steam and Prism totals from before tracking have no dates, so they are left out.",
     "avg-none": "No tracked sessions yet, so no averages.",
     "avg-projected": "(projected)",
-    "avg-proj-short": "(proj.)"
+    "avg-proj-short": "(proj.)",
+    "update-running": "Updating Playtime…",
+    "update-error": "Update failed: {error}",
+    "update-failed": "Updating to {tag} failed. Try again, or run install.sh in a terminal",
+    "update-auto": "Playtime {tag} is out; it installs itself when no game is running",
+    "update-available": "Playtime {tag} is out",
+    "update-button": "Update",
+    "updated": "Updated to {version} (from {from})"
   }
 }

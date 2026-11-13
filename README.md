@@ -73,14 +73,19 @@ per day, week, month and year, overall and per game, from tracked time.
 
 ## Install
 
-Requires Python 3.11+. For the optional server backup: an SSH host alias
-whose key works without a prompt (the daemon uses `BatchMode`) and Python
-3.9+ on the server.
+Requires Python 3.11+ and a systemd user session. For the optional server
+backup: an SSH host alias whose key works without a prompt (the daemon uses
+`BatchMode`) and Python 3.9+ on the server.
 
 ```sh
-./install.sh                      # daemon + systemd user service
-./install.sh ~/path/to/plugins    # also copy the Noctalia plugin into a local plugin source
+curl -fsSL https://raw.githubusercontent.com/Soulmanyes/playtime/main/install.sh | sh
 ```
+
+This installs the latest release: the daemon in `~/.local/lib/playtime`, the
+`playtime.service` user unit and the `playtime` command in `~/.local/bin`.
+If the Noctalia shell is installed, it also adds the bar widget and panel as a
+plugin source named `playtime`; put the "Playtime" widget on your bar in
+Noctalia's bar settings. From a clone, run `./install.sh` instead.
 
 When a server is set, `install.sh` also copies `server.py` to it, so both
 sides always speak the same sync format.
@@ -89,9 +94,30 @@ Edit `~/.config/playtime/config.toml` (from `config.example.toml`) to add rules
 for non-Steam games and, optionally, set `ssh_host`. With `ssh_host` empty
 (the default) everything stays local.
 
-After a reinstall: with a server, restore the SSH key, run `./install.sh`, and
-the first sync pulls the full history back. Without one, run `./install.sh`
-and `playtime restore <copy of playtime.db or a backup>`.
+After a reinstall: with a server, restore the SSH key, install, and the first
+sync pulls the full history back. Without one, install and run
+`playtime restore <copy of playtime.db or a backup>`.
+
+### Updates
+
+The daemon checks GitHub for a new release once a day and installs it by
+itself, only while no game is running. The panel footer says when an update
+was installed, or offers an **Update** button when one is waiting.
+`auto_update = false` in the config turns this off; `playtime update`
+installs the latest release by hand, `playtime update --check` only looks.
+Your history, backups and config are never touched by an update.
+
+An install from a git clone (`./install.sh` in a checkout) never updates
+itself; update it with `git pull` and `./install.sh`.
+
+### Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Soulmanyes/playtime/main/install.sh | sh -s -- --uninstall
+```
+
+This removes the daemon, the command and the Noctalia plugin. The history
+(`~/.local/share/playtime`) and config (`~/.config/playtime`) stay.
 
 ## Commands
 
@@ -103,6 +129,8 @@ playtime summary        rewrite the panel's summary file
 playtime backup         write a local backup now
 playtime restore FILE   merge a backup (or any playtime.db) into the history
 playtime deploy-server  copy server.py to the server
+playtime version        print the installed version
+playtime update         install the latest release now (--check: only look)
 ```
 
 ## Tested

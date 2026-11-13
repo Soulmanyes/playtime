@@ -12,6 +12,10 @@ remote_dir = "playtime"
 # to keep. 0 turns them off.
 backup_keep = 7
 
+# Install new Playtime releases from GitHub by itself, between games.
+# Checked once a day. `playtime update` installs one by hand.
+auto_update = true
+
 poll_seconds = 10
 sync_minutes = 15
 # Shorter sessions are not saved.

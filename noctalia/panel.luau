@@ -228,6 +228,67 @@ local function gameRow(game, total)
   }, children)
 end
 
+-- Update line in the footer: after an update, while one waits or runs.
+local updating = false
+local updateError = nil
+
+local function runUpdate()
+  updating, updateError = true, nil
+  local script = tostring(noctalia.getenv("HOME")) .. "/.local/lib/playtime/playtime.py"
+  local started = noctalia.runAsync({ "python3", "-I", script, "update" }, function(r)
+    updating = false
+    if r.exitCode ~= 0 then
+      local lines = {}
+      for line in tostring(r.stderr or ""):gmatch("[^\n]+") do
+        lines[#lines + 1] = line
+      end
+      updateError = lines[#lines] or ("exit " .. tostring(r.exitCode))
+    end
+    render()
+  end, 180000)
+  if not started then
+    updating, updateError = false, "could not start playtime update"
+  end
+  render()
+end
+
+local function updateRow()
+  local u = data.update
+  if type(u) ~= "table" then
+    return nil
+  end
+  local function note(text, color)
+    return ui.label({ text = text, fontSize = 11, color = color or "on_surface_variant", maxLines = 2 })
+  end
+  if updating then
+    return note(noctalia.tr("ui.update-running"))
+  end
+  if updateError then
+    return note(noctalia.tr("ui.update-error", { error = updateError }), "error")
+  end
+  local tag = tostring(u.available or "")
+  if tag ~= "" and not u.dev then
+    local text
+    if u.failed then
+      text = noctalia.tr("ui.update-failed", { tag = tag })
+    elseif u.auto then
+      text = noctalia.tr("ui.update-auto", { tag = tag })
+    else
+      text = noctalia.tr("ui.update-available", { tag = tag })
+    end
+    return ui.row({ align = "center", gap = 8 }, {
+      ui.label({ text = text, fontSize = 11, color = u.failed and "error" or "on_surface_variant",
+                 flexGrow = 1, maxLines = 2 }),
+      ui.button({ key = "update", text = noctalia.tr("ui.update-button"), variant = "primary",
+                  onClick = runUpdate }),
+    })
+  end
+  if tostring(u.updated_from or "") ~= "" then
+    return note(noctalia.tr("ui.updated", { version = tostring(u.version), from = tostring(u.updated_from) }))
+  end
+  return nil
+end
+
 local function footer()
   local sync = data.sync or {}
   local text, color
@@ -250,6 +311,10 @@ local function footer()
   if shared.stale(data) then
     rows[#rows + 1] = ui.label({ text = noctalia.tr("ui.stale", { ago = shared.ago(data.updated) }),
                                  fontSize = 11, color = "error" })
+  end
+  local update = updateRow()
+  if update then
+    rows[#rows + 1] = update
   end
   return ui.column({ gap = 2 }, rows)
 end

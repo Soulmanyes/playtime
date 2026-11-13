@@ -10,6 +10,8 @@ backs it up daily next to it, and optionally mirrors it to a server over SSH.
   playtime.py backup         write a local backup of the history now
   playtime.py restore FILE   merge a backup (or any playtime.db) into the history
   playtime.py deploy-server  copy server.py to the server
+  playtime.py version        print the installed version
+  playtime.py update         install the latest release now (--check: only look)
 
 Games are found by scanning /proc. Steam games run under Steam's `reaper
 SteamLaunch AppId=N` process, Prism Launcher's Minecraft runs as java with
@@ -48,7 +50,13 @@ SUMMARY_PATH = STATE_DIR / "summary.json"
 # Per-game session spans for the panel's drill-down chart. A separate file so
 # the bar widget, which reads the summary every minute, never parses it.
 HISTORY_PATH = STATE_DIR / "history.json"
-SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
+APP_DIR = Path(__file__).resolve().parent
+SERVER_SCRIPT = APP_DIR / "server.py"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "playtime"
+UPDATE_STATE = STATE_DIR / "update.json"
+REPO = "Soulmanyes/playtime"
+# How often the daemon asks the updater; it asks GitHub once a day at most.
+UPDATE_POLL_SECONDS = 3600
 
 DEFAULTS = {
     # Empty: local only, no server sync.
@@ -66,6 +74,8 @@ DEFAULTS = {
     "import_steam_types": ["game"],
     # Daily local backups of the history to keep; 0 turns them off.
     "backup_keep": 7,
+    # Install new releases from GitHub by itself (checked once a day).
+    "auto_update": True,
 }
 
 
@@ -1065,6 +1075,24 @@ def write_json(path, data):
     tmp.replace(path)
 
 
+_updater = None
+
+
+def get_updater():
+    """The updater (updater.py next to this file), or None without one. The
+    service runs python -I, which leaves this file's folder off sys.path."""
+    global _updater
+    if _updater is None:
+        if str(APP_DIR) not in sys.path:
+            sys.path.insert(0, str(APP_DIR))
+        try:
+            import updater
+        except ImportError:
+            return None
+        _updater = updater.Updater(REPO, APP_DIR, UPDATE_STATE, CACHE_DIR)
+    return _updater
+
+
 def write_summary(db, live_sessions, cfg):
     now = int(time.time())
     data = {
@@ -1081,6 +1109,9 @@ def write_summary(db, live_sessions, cfg):
         },
         "backup": {"ok": last_backup()},
     }
+    upd = get_updater()
+    if upd:
+        data["update"] = dict(upd.status(), auto=bool(cfg["auto_update"]))
     write_json(SUMMARY_PATH, data)
     write_json(HISTORY_PATH, {"updated": now,
                               "games": history(db, live_sessions, cfg["import_steam_types"])})
@@ -1215,7 +1246,24 @@ def run():
         db.commit()
 
     heartbeat()
-    log(f"playtime running, db {DB_PATH}, "
+    upd = get_updater()
+    if upd:
+        upd.note_start()
+    # The update check runs in a thread (network); the main loop installs, and
+    # only between games, since the install restarts this daemon.
+    update_ready = []
+    next_update_check = 0
+
+    def check_update():
+        try:
+            latest = upd.check()
+        except (OSError, ValueError, KeyError) as e:
+            log(f"update check failed: {e!r}")
+            return
+        if latest and not upd.dev_checkout and not upd.attempted(latest):
+            update_ready.append(latest)
+
+    log(f"playtime {upd.version if upd else '?'} running, db {DB_PATH}, "
         + (f"server {cfg['ssh_host']}" if server else "local only (no ssh_host)"))
 
     # Names of played Steam apps that no local cache knows come from the
@@ -1284,6 +1332,18 @@ def run():
                     log(f"backup failed: {e!r}")
             next_backup = now + 3600
 
+        if upd and cfg["auto_update"] and not upd.dev_checkout and now >= next_update_check:
+            next_update_check = now + UPDATE_POLL_SECONDS
+            threading.Thread(target=check_update, daemon=True).start()
+        if update_ready and not tracker.active:
+            latest = update_ready.pop()
+            log(f"updating to {latest['tag']}")
+            try:
+                upd.install(latest, detach=True)
+            except (OSError, RuntimeError) as e:
+                log(f"update failed: {e}")
+            last_summary = 0
+
         if now - last_summary >= SUMMARY_SECONDS:
             write_summary(db, tracker.live(), cfg)
             last_summary = now
@@ -1301,6 +1361,26 @@ def run():
         if err:
             log(err)
     log("playtime stopped")
+
+
+def update_now(check_only):
+    upd = get_updater()
+    if upd is None:
+        sys.exit("no updater.py next to playtime.py; reinstall with install.sh")
+    try:
+        latest = upd.check(force=True)
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"could not reach GitHub: {e}")
+    if not latest:
+        print(f"playtime {upd.version} is the latest")
+        return
+    print(f"playtime {latest['tag']} is out (installed: {upd.version})")
+    if check_only:
+        return
+    try:
+        upd.install(latest, detach=False)
+    except (OSError, RuntimeError) as e:
+        sys.exit(f"update failed: {e}")
 
 
 def main():
@@ -1348,6 +1428,12 @@ def main():
         err = deploy_server(load_config())
         if err:
             sys.exit(err)
+    elif cmd == "version":
+        upd = get_updater()
+        version = (upd.version if upd else "") or "unknown"
+        print(version + (" (from a git checkout)" if upd and upd.dev_checkout else ""))
+    elif cmd == "update":
+        update_now(check_only="--check" in sys.argv[2:])
     else:
         sys.exit(__doc__)
 

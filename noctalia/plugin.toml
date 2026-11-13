@@ -1,12 +1,12 @@
 id = "soulmanyes/playtime"
 name = "Playtime"
-version = "1.3.0"
+version = "1.4.0"
 # 32: container tooltips; also require (22) and readFileAsync (23).
 plugin_api = 32
-author = "soulmanyes"
+author = "Soulmanyes"
 license = "CC0-1.0"
 icon = "device-gamepad-2"
-description = "Game playtime from the playtime daemon: today in the bar, day/week/month/year/all-time in the panel; click a game for its own chart and click bars to drill down."
+description = "Game playtime from the playtime daemon: today in the bar; day/week/month/year/all-time and average playtime in the panel; click a game for its own chart and click bars to drill down."
 tags = ["gaming", "bar", "panel"]
 dependencies = ["python3"]
 
