@@ -10,6 +10,10 @@ chart, starting at the current year; clicking a bar drills down from year to
 month, then to the clicked day by hour. The Averages tab shows average playtime
 per day, week, month and year, overall and per game, from tracked time.
 
+![Month view: a bar per day and the games played](screenshots/month.png)
+
+![Averages tab: per day, week, month and year, overall and per game](screenshots/averages.png)
+
 ## How it works
 
 - **Daemon** (`playtime.py run`, systemd user service) scans `/proc` every
