@@ -26,12 +26,12 @@ import os
 import re
 import signal
 import socket
-import struct
 import sqlite3
+import struct
 import subprocess
 import sys
-import time
 import threading
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -760,7 +760,7 @@ def sync(db, cfg):
     cmd = ssh_base(cfg) + [f"python3 {remote}/server.py {remote}/playtime.db"]
     try:
         proc = subprocess.run(cmd, input=json.dumps({"sessions": rows, "imported": imported}),
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=60, check=False)
     except (subprocess.TimeoutExpired, OSError) as e:
         err = f"sync failed: {e}"
     else:
@@ -965,7 +965,7 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
         buckets = [0] * (len(edges) - 1)
         games = {}
 
-        def add(key, name, detail, seconds):
+        def add(key, name, detail, seconds, games=games):
             g = games.setdefault(group_key(key),
                                  {"key": group_key(key), "name": name, "seconds": 0, "details": {}})
             if not key.startswith(("prism:", "minecraft")):
@@ -1196,7 +1196,7 @@ def run():
     try:
         # Also fills the name cache from appinfo.vdf before the store lookup.
         import_totals(db, cfg, steam, set(scan(cfg, steam)))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - a bad Steam/Prism file must not stop the daemon
         log(f"import failed: {e!r}")
     missing = missing_app_names(db, list(steam_playtimes()))
     if missing:
@@ -1237,7 +1237,7 @@ def run():
             tracker.checkpoint()
             try:
                 import_totals(db, cfg, steam, set(tracker.active))
-            except Exception as e:  # a half-written Steam file must not stop tracking
+            except Exception as e:  # noqa: BLE001 - a half-written Steam file must not stop tracking
                 log(f"import failed: {e!r}")
             if server:
                 err = sync(db, cfg)
