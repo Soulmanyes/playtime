@@ -10,6 +10,7 @@
     "tab-month": "Month",
     "tab-year": "Year",
     "tab-all": "All time",
+    "tab-avg": "Averages",
     "total": "Total",
     "before": "Bars show tracked time; {time} more comes from Steam and Prism totals from before tracking",
     "more": "+ {count} more games",
@@ -21,6 +22,15 @@
     "sync-error": "Sync error: {error}",
     "local-only": "Saved locally, no server set",
     "local-only-backup": "Saved locally, backed up {ago}",
-    "stale": "Data is {ago} old: the daemon may be stopped"
+    "stale": "Data is {ago} old: the daemon may be stopped",
+    "avg-day": "Per day",
+    "avg-week": "Per week",
+    "avg-month": "Per month",
+    "avg-year": "Per year",
+    "avg-game": "Game",
+    "avg-based": "Averages of tracked time over {days} days since {since}. Units longer than that are projected from those days. Steam and Prism totals from before tracking have no dates, so they are left out.",
+    "avg-none": "No tracked sessions yet, so no averages.",
+    "avg-projected": "(projected)",
+    "avg-proj-short": "(proj.)"
   }
 }

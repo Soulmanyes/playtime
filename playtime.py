@@ -1009,6 +1009,33 @@ def summarize(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     return periods
 
 
+def averages(db, live=()):
+    """Tracked seconds overall and per game group, with the span they cover:
+    from the first tracked session to now. The panel divides by `days` for
+    its per day/week/month/year averages. Imported totals have no dates, so
+    they are left out."""
+    sessions = load_sessions(db, live)
+    first = min((s["start"] for s in sessions.values()), default=None)
+    if first is None:
+        return {"since": None, "days": 0, "total": 0, "games": []}
+    games = {}
+    for s in sessions.values():
+        seconds = s["end"] - s["start"]
+        if seconds <= 0:
+            continue
+        key = group_key(s["game_key"])
+        g = games.setdefault(key, {"key": key, "name": s["game_name"], "seconds": 0})
+        if not s["game_key"].startswith(("prism:", "minecraft")):
+            g["name"] = s["game_name"]
+        g["seconds"] += seconds
+    game_list = sorted(games.values(), key=lambda g: -g["seconds"])
+    return {"since": first,
+            # At least one day, so a first session doesn't blow up the rate.
+            "days": max(1.0, (time.time() - first) / 86400),
+            "total": sum(g["seconds"] for g in game_list),
+            "games": game_list}
+
+
 def history(db, live=(), import_types=DEFAULTS["import_steam_types"]):
     """Per game group: tracked session spans [start, end] sorted by start, and
     the imported baseline seconds, which have no dates and so no bars."""
@@ -1045,6 +1072,7 @@ def write_summary(db, live_sessions, cfg):
         "live": [{"name": s["game_name"], "detail": s["detail"], "seconds": s["end"] - s["start"]}
                  for s in live_sessions],
         "periods": summarize(db, live_sessions, cfg["import_steam_types"]),
+        "averages": averages(db, live_sessions),
         "sync": {
             "enabled": server_enabled(cfg),
             "ok": int(get_meta(db, "sync_ok") or 0),

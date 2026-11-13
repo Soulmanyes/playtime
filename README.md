@@ -7,7 +7,8 @@ widget shows today's total; its panel shows day, week, month, year and
 all-time stats per game, as bar charts with a time y-axis on round ticks. All time also includes everything Steam and Prism
 Launcher recorded before tracking started. Clicking a game opens its own bar
 chart, starting at the current year; clicking a bar drills down from year to
-month, then to the clicked day by hour.
+month, then to the clicked day by hour. The Averages tab shows average playtime
+per day, week, month and year, overall and per game, from tracked time.
 
 ## How it works
 
@@ -60,6 +61,11 @@ month, then to the clicked day by hour.
     session as a start/end pair per game, bucketed in the panel. Only tracked
     time has dates; imported Steam and Prism totals show as a note under the
     chart. A separate file keeps the bar widget's minutely read small.
+  - The Averages tab uses the `averages` block in `summary.json`: tracked
+    seconds overall and per game, and the days since the first tracked
+    session. Each average is seconds / days x unit length (a month is 30.44
+    days). A unit longer than the tracked span is marked "(projected)".
+    Imported totals have no dates, so they are left out.
   - In a game view: the back button or Escape goes up a level (from the year
     back to the list), the arrows or Left/Right move to the previous or next
     period. `noctalia msg panel-open soulmanyes/playtime:panel "game steam:240

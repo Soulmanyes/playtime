@@ -6,8 +6,9 @@
 
 local shared = require("./shared.luau")
 local history = require("./history.luau")
+local averages = require("./averages.luau")
 
-local TABS = { "day", "week", "month", "year", "all" }
+local TABS = { "day", "week", "month", "year", "all", "avg" }
 local CHART_HEIGHT = 180
 local CHART_WIDTH = 840
 -- Sparse x labels so 24 hours or 31 days stay readable.
@@ -339,6 +340,101 @@ local function gameView(header)
   panel.render(ui.column({ gap = 12, padding = 16, flexGrow = 1, align = "stretch" }, body))
 end
 
+-- Averages tab: one card per unit for all games, then each game's averages
+-- in columns. Rows open the game view like the period lists do.
+local AVG_COL_W = 104
+
+local function avgCard(unit, avg)
+  return ui.column({ key = "avg-card-" .. unit.name, flexGrow = 1, gap = 2, padding = 10, radius = 10,
+                     fill = "surface_variant/0.9", border = "outline/0.6", borderWidth = 1 }, {
+    ui.label({ text = noctalia.tr("ui.avg-" .. unit.name)
+                     .. (averages.projected(avg, unit) and " " .. noctalia.tr("ui.avg-projected") or ""),
+               fontSize = 11, color = "on_surface_variant" }),
+    ui.label({ text = shared.duration(averages.rate(avg.total, avg.days, unit.days)),
+               fontSize = 20, fontWeight = "bold" }),
+  })
+end
+
+-- Header cells mark projected units with "(proj.)"; the cards spell it out.
+local function avgCells(seconds, days, opts)
+  local cells = {}
+  for _, unit in ipairs(averages.UNITS) do
+    local text
+    if opts.header then
+      text = noctalia.tr("ui.avg-" .. unit.name)
+      if averages.projected({ days = days }, unit) then
+        text = text .. " " .. noctalia.tr("ui.avg-proj-short")
+      end
+    else
+      text = shared.duration(averages.rate(seconds, days, unit.days))
+    end
+    cells[#cells + 1] = ui.row({ width = AVG_COL_W, flexShrink = 0, justify = "end" }, {
+      ui.label({ text = text,
+                 fontSize = opts.header and 11 or 13, color = opts.header and "on_surface_variant" or nil,
+                 fontWeight = opts.bold and "bold" or nil, maxLines = 1 }),
+    })
+  end
+  return cells
+end
+
+local function avgGameRow(game, avg)
+  local key = "avg-game-" .. tostring(game.key or game.name)
+  local lit = hovered == key
+  local cells = avgCells(game.seconds, avg.days, {})
+  table.insert(cells, 1, ui.label({ text = tostring(game.name), fontSize = 13, flexGrow = 1, maxLines = 1 }))
+  return ui.column({
+    key = key,
+    gap = 4,
+    paddingH = 8,
+    paddingV = 6,
+    radius = 8,
+    fill = lit and "surface_variant/0.9" or "surface_variant/0",
+    border = lit and "primary/0.85" or "outline/0",
+    borderWidth = 1,
+    onHover = hover(key),
+    onClick = function()
+      selectGame(game)
+    end,
+  }, {
+    ui.row({ align = "center", gap = 8 }, cells),
+    ui.progress({ progress = (tonumber(avg.total) or 0) > 0 and (tonumber(game.seconds) or 0) / avg.total or 0,
+                  height = 5, radius = 2, track = "on_surface/0.22" }),
+  })
+end
+
+local function averagesView(header)
+  local avg = data.averages or {}
+  local body = { header, tabRow("avg") }
+  local since = averages.since(avg)
+  if since == nil then
+    body[#body + 1] = ui.label({ text = noctalia.tr("ui.avg-none"), color = "on_surface_variant" })
+    body[#body + 1] = footer()
+    panel.render(ui.column({ gap = 12, padding = 16, flexGrow = 1, align = "stretch" }, body))
+    return
+  end
+  local cards = {}
+  for _, unit in ipairs(averages.UNITS) do
+    cards[#cards + 1] = avgCard(unit, avg)
+  end
+  body[#body + 1] = ui.row({ gap = 8 }, cards)
+  body[#body + 1] = ui.label({ text = noctalia.tr("ui.avg-based", { days = averages.days(avg), since = since }),
+                               fontSize = 11, color = "on_surface_variant", maxLines = 2 })
+  local headerCells = avgCells(0, avg.days, { header = true })
+  table.insert(headerCells, 1, ui.label({ text = noctalia.tr("ui.avg-game"), fontSize = 11,
+                                          color = "on_surface_variant", flexGrow = 1 }))
+  body[#body + 1] = ui.row({ align = "center", gap = 8, paddingH = 9 }, headerCells)
+  local rows = {}
+  for i, g in ipairs(avg.games or {}) do
+    if i > MAX_GAMES then
+      break
+    end
+    rows[#rows + 1] = avgGameRow(g, avg)
+  end
+  body[#body + 1] = ui.scroll({ gap = 6, flexGrow = 1 }, rows)
+  body[#body + 1] = footer()
+  panel.render(ui.column({ gap = 12, padding = 16, flexGrow = 1, align = "stretch" }, body))
+end
+
 function render()
   if not open then
     return
@@ -361,6 +457,10 @@ function render()
   end
 
   local tab = currentTab()
+  if tab == "avg" then
+    averagesView(header)
+    return
+  end
   local period = data.periods[tab] or { total = 0, games = {}, buckets = {} }
   local total = tonumber(period.total) or 0
 
